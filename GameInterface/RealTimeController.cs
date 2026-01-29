@@ -23,6 +23,7 @@ namespace CompanionAI_Pathfinder.GameInterface
     /// <summary>
     /// Real-time combat AI controller
     /// v0.2.0: 계획 시스템 통합 - SituationAnalyzer, TargetScorer, Role-based 결정
+    /// ★ v0.2.49: AoE 위험 지역 탈출 로직 추가
     /// </summary>
     public class RealTimeController
     {
@@ -155,14 +156,101 @@ namespace CompanionAI_Pathfinder.GameInterface
             _processCount++;
             Main.Verbose($"[RT] ProcessUnit: {unitName} (#{_processCount}, phase={phaseOffset:F2}s)");
 
-            // v0.2.21: NextCommandTime과 능력 시전 체크는 CustomBrainPatch.TickBrain_Prefix에서 수행
-            // 여기서는 중복 체크하지 않음
+            // ★ v0.2.45: NextCommandTime 체크 추가 (움찔거림 방지)
+            // 이전에 발행한 명령의 쿨다운이 끝나지 않았으면 새 결정 안함
+            if (!IsNextCommandTimeReady(unit))
+            {
+                return;
+            }
 
             // Check if can act
-            if (!(unit.Descriptor?.State?.CanAct ?? false))
+            // ★ v0.2.43: 실시간 전투에서는 핵심 조건만 체크
+            // 기존 CanAct는 IsInExclusiveState(애니메이션)를 체크하는데, 이것이 stuck되면 AI 전체가 멈춤
+            // 대신 치명적인 상태만 체크하고, 애니메이션 상태는 Commands.Empty 체크로 커버
+            var state = unit.Descriptor?.State;
+            if (state == null)
             {
-                Main.Verbose($"[RT] {unitName}: Cannot act");
+                Main.Verbose($"[RT] {unitName}: Cannot act - State=null");
                 return;
+            }
+
+            // 치명적 상태만 체크 (애니메이션 상태는 Commands.Empty로 처리)
+            if (state.IsDead)
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Dead");
+                return;
+            }
+            if (!state.IsConscious)
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - NotConscious");
+                return;
+            }
+            if (state.IsUnconscious)
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Unconscious");
+                return;
+            }
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Paralyzed))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Paralyzed");
+                return;
+            }
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Petrified))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Petrified");
+                return;
+            }
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Stunned))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Stunned");
+                return;
+            }
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.CantAct))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - CantAct condition");
+                return;
+            }
+            // ★ v0.2.45: 추가 CC 조건 체크
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Dazed))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Dazed");
+                return;
+            }
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Nauseated))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Nauseated");
+                return;
+            }
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Cowering))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Cowering (fear)");
+                return;
+            }
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Frightened))
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Frightened");
+                return;
+            }
+            if (state.Prone?.Active == true)
+            {
+                Main.Verbose($"[RT] {unitName}: Cannot act - Prone (knockdown)");
+                return;
+            }
+            // ★ v0.2.43: IsInExclusiveState는 체크하지 않음 - Commands.Empty 체크가 커버함
+
+            // ★ v0.2.49: AoE 위험 지역 탈출 우선 체크
+            // 이동 가능한 상태라면 AoE 위험 지역에서 탈출 시도
+            if (state.CanMove)
+            {
+                var aoeDanger = AoeDangerAnalyzer.AnalyzeUnit(unit);
+                if (aoeDanger.ShouldEscape && aoeDanger.SuggestedEscapePosition.HasValue)
+                {
+                    // AoE 탈출이 필요하면 바로 실행
+                    Main.Log($"[RT] {unitName}: PRIORITY - Escaping AoE danger zone (level={aoeDanger.TotalDangerLevel:F2})");
+                    ExecuteMoveAction(unit, aoeDanger.SuggestedEscapePosition.Value, "Emergency AoE escape");
+                    _lastDecisionTime[unitId] = currentTime;
+                    return;
+                }
             }
 
             // Check combat state
@@ -171,6 +259,77 @@ namespace CompanionAI_Pathfinder.GameInterface
                 // v0.2.2: 전투 외 상황에서 영구 버프 자동 적용
                 ApplyPermanentBuffsOutOfCombat(unit);
                 Main.Verbose($"[RT] {unitName}: Not in combat, checked permanent buffs");
+                return;
+            }
+
+            // ★ v0.2.47: 명령 상태 상세 체크 + Stuck 명령 감지/취소
+            if (!unit.Commands.Empty)
+            {
+                try
+                {
+                    var rawCommands = unit.Commands.Raw;
+                    bool hasStuckCommand = false;
+                    UnitCommand stuckCommand = null;
+
+                    foreach (var cmd in rawCommands)
+                    {
+                        if (cmd == null || cmd.IsFinished) continue;
+
+                        // Started=False인 명령이 있으면 stuck 가능성
+                        if (!cmd.IsStarted)
+                        {
+                            hasStuckCommand = true;
+                            stuckCommand = cmd;
+                            break;
+                        }
+                    }
+
+                    if (hasStuckCommand && stuckCommand != null)
+                    {
+                        // ★ v0.2.47: Stuck 명령 감지 - 강제 취소 및 블랙리스트
+                        string cmdType = stuckCommand.GetType().Name;
+                        Main.Verbose($"[RT] {unitName}: Stuck command detected ({cmdType}, Started=False) - cancelling");
+
+                        // UnitUseAbility인 경우 능력 정보 추출하여 블랙리스트
+                        if (stuckCommand is UnitUseAbility useAbilityCmd)
+                        {
+                            var ability = useAbilityCmd.Ability;
+                            var target = useAbilityCmd.Target?.Unit;
+                            if (ability != null && target != null)
+                            {
+                                FailedAbilityTracker.Instance.RecordFailure(unit, ability, target);
+                                Main.Log($"[RT] {unitName}: Blacklisted stuck ability {ability.Name} -> {target.CharacterName}");
+                            }
+                        }
+
+                        // 명령 강제 취소
+                        try
+                        {
+                            unit.Commands.InterruptAll();
+                            Main.Verbose($"[RT] {unitName}: Commands interrupted");
+                        }
+                        catch (Exception cancelEx)
+                        {
+                            Main.Verbose($"[RT] {unitName}: Failed to interrupt: {cancelEx.Message}");
+                        }
+
+                        return;
+                    }
+
+                    // 정상 진행 중인 명령 (Started=True)
+                    Main.Verbose($"[RT] {unitName}: Commands in progress (normal)");
+                }
+                catch (Exception ex)
+                {
+                    Main.Verbose($"[RT] {unitName}: Commands check error: {ex.Message}");
+                }
+                return;
+            }
+
+            // ★ v0.2.41: 탑승된 마운트는 건너뛰기 (라이더가 제어함)
+            // 이 유닛이 누군가의 마운트인지 확인
+            if (IsMountBeingRidden(unit))
+            {
                 return;
             }
 
@@ -359,6 +518,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         /// <summary>
         /// ★ v0.2.22: 능력 실행
+        /// ★ v0.2.48: 반복 명령 감지 추가
         /// </summary>
         private void ExecuteAbilityAction(UnitEntityData unit, ActionCandidate action)
         {
@@ -371,6 +531,13 @@ namespace CompanionAI_Pathfinder.GameInterface
             string unitName = unit.Descriptor?.CharacterName ?? "Unknown";
             string targetName = action.Target.Descriptor?.CharacterName ?? "Unknown";
 
+            // ★ v0.2.48: 반복 명령 감지 - 같은 능력+타겟이 짧은 시간 내 반복되면 블랙리스트
+            if (FailedAbilityTracker.Instance.RecordCommandAndCheckRepeat(unit, action.Ability, action.Target))
+            {
+                Main.Log($"[RT] {unitName}: Repeat detected for {action.Ability.Name} -> {targetName}, skipping");
+                return;
+            }
+
             var targetWrapper = new TargetWrapper(action.Target);
             if (!action.Ability.CanTarget(targetWrapper))
             {
@@ -382,6 +549,17 @@ namespace CompanionAI_Pathfinder.GameInterface
             {
                 var command = new UnitUseAbility(action.Ability, targetWrapper);
                 unit.Commands.Run(command);
+
+                // ★ v0.2.46: 명령이 실제로 큐에 들어갔는지 확인
+                // 명령이 바로 취소되면 Commands.Empty가 true 상태 유지
+                if (unit.Commands.Empty)
+                {
+                    // 명령이 큐에 들어가지 않음 - 이 능력+타겟 조합 블랙리스트
+                    FailedAbilityTracker.Instance.RecordFailure(unit, action.Ability, action.Target);
+                    Main.Verbose($"[RT] {unitName}: Command for {action.Ability.Name} -> {targetName} failed to queue (blacklisted)");
+                    return;
+                }
+
                 SetNextCommandTime(unit, command);
                 RecordAbilityUse(unit, action.Ability);
 
@@ -1534,6 +1712,31 @@ namespace CompanionAI_Pathfinder.GameInterface
             {
                 Main.Verbose($"[RT] SetNextCommandTime error: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// ★ v0.2.41: 이 유닛이 누군가의 마운트인지 확인
+        /// 마운트가 탑승된 상태면 라이더가 명령을 내리므로 마운트 자체는 AI 처리 불필요
+        /// </summary>
+        private bool IsMountBeingRidden(UnitEntityData unit)
+        {
+            try
+            {
+                // 모든 아군 유닛을 순회하며 이 유닛을 타고 있는지 확인
+                foreach (var other in Kingmaker.Game.Instance.State.Units)
+                {
+                    if (other == null || other == unit) continue;
+
+                    var riderPart = other.Get<Kingmaker.UnitLogic.Parts.UnitPartRider>();
+                    if (riderPart != null && riderPart.SaddledUnit == unit)
+                    {
+                        // other가 unit을 타고 있음
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
         }
 
         #endregion

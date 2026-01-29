@@ -1,5 +1,8 @@
 // ★ v0.2.22: Unified Decision Engine - Main Entry Point
 // ★ v0.2.33: 성능 측정 코드 추가
+// ★ v0.2.41: FinalScore → HybridFinalScore 수정 (Geometric Mean 기반 선택)
+// ★ v0.2.48: SpellDescriptor 면역 체크 추가 (악의 눈→드레치 무한 루프 해결)
+// ★ v0.2.49: AoE 위험 지역 탈출 및 CC 탈출 로직 추가
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -118,7 +121,8 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 _scorer.LogTopCandidates(candidates, unitName);
 
                 // 6. Select best (highest score)
-                var best = candidates.OrderByDescending(c => c.FinalScore).First();
+                // ★ v0.2.41: HybridFinalScore 사용 (Geometric Mean 기반)
+                var best = candidates.OrderByDescending(c => c.HybridFinalScore).First();
 
                 // ★ v0.2.33: 성능 로그 출력
                 swTotal.Stop();
@@ -128,7 +132,7 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 }
 
                 Main.Log($"[DecisionEngine] {unitName} Phase={phase}: " +
-                         $"Selected {best.ActionType} (Score={best.FinalScore:F1})");
+                         $"Selected {best.ActionType} (Score={best.HybridFinalScore:F1})");
 
                 return best;
             }
@@ -165,7 +169,8 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 _scorer.ScoreAll(candidates, situation, situation.CombatPhase);
                 _scorer.LogTopCandidates(candidates, unitName);
 
-                return candidates.OrderByDescending(c => c.FinalScore).First();
+                // ★ v0.2.41: HybridFinalScore 사용
+                return candidates.OrderByDescending(c => c.HybridFinalScore).First();
             }
             catch (Exception ex)
             {
@@ -180,11 +185,20 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
 
         /// <summary>
         /// Generate all possible action candidates
+        /// ★ v0.2.49: AoE 위험/CC 탈출 후보 우선 생성
         /// </summary>
         private List<ActionCandidate> GenerateCandidates(
             UnitEntityData unit, Situation situation, TurnState turnState)
         {
             var candidates = new List<ActionCandidate>();
+
+            // ★ v0.2.49: 위험 상황 분석 (AoE 지역 + CC 상태)
+            var aoeDanger = AoeDangerAnalyzer.AnalyzeUnit(unit);
+            var ccAnalysis = CrowdControlAnalyzer.AnalyzeUnit(unit);
+
+            // === 0. PRIORITY: Escape dangerous situations ===
+            // CC 탈출 및 AoE 탈출은 최우선
+            GenerateEscapeCandidates(candidates, unit, situation, aoeDanger, ccAnalysis);
 
             // === 1. Attack candidates (abilities + basic attack) ===
             GenerateAttackCandidates(candidates, unit, situation);
@@ -231,6 +245,20 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                         var targetWrapper = new TargetWrapper(enemy);
                         if (!attack.CanTarget(targetWrapper))
                             continue;
+
+                        // ★ v0.2.46: 블랙리스트된 능력+타겟 조합 제외 (Hex 1회 제한 등)
+                        if (FailedAbilityTracker.Instance.IsBlacklisted(unit, attack, enemy))
+                        {
+                            Main.Verbose($"[DecisionEngine] Skipping blacklisted: {attack.Name} -> {enemy.CharacterName}");
+                            continue;
+                        }
+
+                        // ★ v0.2.48: SpellDescriptor 면역 체크 (Mind-Affecting 면역 등)
+                        if (TargetImmunityChecker.IsImmuneTo(enemy, attack))
+                        {
+                            Main.Verbose($"[DecisionEngine] Skipping immune target: {attack.Name} -> {enemy.CharacterName}");
+                            continue;
+                        }
 
                         var classification = AbilityClassifier.Classify(attack, unit);
                         var effectiveness = AbilityClassifier.EvaluateEffectiveness(classification, enemy);
@@ -432,6 +460,13 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                     if (!debuff.CanTarget(targetWrapper))
                         continue;
 
+                    // ★ v0.2.48: SpellDescriptor 면역 체크
+                    if (TargetImmunityChecker.IsImmuneTo(enemy, debuff))
+                    {
+                        Main.Verbose($"[DecisionEngine] Skipping immune debuff target: {debuff.Name} -> {enemy.CharacterName}");
+                        continue;
+                    }
+
                     effectiveness = AbilityClassifier.EvaluateEffectiveness(classification, enemy);
 
                     // Only if reasonably effective
@@ -518,6 +553,82 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                             Main.Verbose($"[DecisionEngine] Added reposition candidate: {repositionDecision}");
                         }
                     }
+                }
+            }
+        }
+
+        #endregion
+
+        #region Escape Candidates (v0.2.49)
+
+        /// <summary>
+        /// ★ v0.2.49: 위험 상황 탈출 후보 생성
+        /// AoE 위험 지역 탈출 및 CC 해제/탈출
+        /// </summary>
+        private void GenerateEscapeCandidates(
+            List<ActionCandidate> candidates,
+            UnitEntityData unit,
+            Situation situation,
+            AoeDangerAnalyzer.DangerAnalysis aoeDanger,
+            CrowdControlAnalyzer.CCAnalysis ccAnalysis)
+        {
+            // === CC 탈출 처리 ===
+            if (ccAnalysis.IsUnderCC)
+            {
+                Main.Log($"[DecisionEngine] {unit.CharacterName} is under CC: {ccAnalysis.MaxSeverity}");
+
+                // CC 해제 능력 사용 가능?
+                foreach (var option in ccAnalysis.EscapeOptions)
+                {
+                    if (option.Type == CrowdControlAnalyzer.EscapeType.SelfAbility && option.Ability != null)
+                    {
+                        var classification = AbilityClassifier.Classify(option.Ability, unit);
+
+                        // CC 해제는 매우 높은 우선순위
+                        var candidate = ActionCandidate.Buff(
+                            option.Ability,
+                            classification,
+                            unit,
+                            $"CC Escape: {option.Description}"
+                        );
+
+                        // 점수 부스트 (CC 탈출은 최우선)
+                        candidate.PriorityBoost = 100f * (float)ccAnalysis.MaxSeverity;
+                        candidates.Add(candidate);
+
+                        Main.Verbose($"[DecisionEngine] Added CC escape: {option.Ability.Name} (boost={candidate.PriorityBoost:F0})");
+                    }
+                }
+
+                // Prone 상태면 일어나기 (특별 처리)
+                if (ccAnalysis.ActiveCCs.Any(c => c.Condition == Kingmaker.UnitLogic.UnitCondition.Prone))
+                {
+                    // Stand Up은 별도 처리 필요 (게임 API에서 지원하는지 확인 필요)
+                    Main.Verbose($"[DecisionEngine] {unit.CharacterName} is Prone - stand up needed");
+                }
+            }
+
+            // === AoE 위험 지역 탈출 ===
+            if (aoeDanger.ShouldEscape && aoeDanger.SuggestedEscapePosition.HasValue)
+            {
+                // 이동 가능한지 확인
+                if (situation.CanMove && (ccAnalysis.CanMove || !ccAnalysis.IsUnderCC))
+                {
+                    var escapeCandidate = ActionCandidate.Move(
+                        aoeDanger.SuggestedEscapePosition.Value,
+                        $"Escape AoE danger (level={aoeDanger.TotalDangerLevel:F2})"
+                    );
+
+                    // 위험도에 따른 우선순위 부스트
+                    escapeCandidate.PriorityBoost = 50f * aoeDanger.TotalDangerLevel;
+                    candidates.Add(escapeCandidate);
+
+                    string effectNames = string.Join(", ", aoeDanger.DangerousEffects.Select(e => e.Name));
+                    Main.Log($"[DecisionEngine] {unit.CharacterName} should escape AoE: {effectNames}");
+                }
+                else
+                {
+                    Main.Verbose($"[DecisionEngine] {unit.CharacterName} can't escape AoE (CanMove={situation.CanMove}, CC.CanMove={ccAnalysis.CanMove})");
                 }
             }
         }

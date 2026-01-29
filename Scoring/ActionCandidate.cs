@@ -1,5 +1,6 @@
 // ★ v0.2.22: Unified Decision Engine - Action Candidate
 // ★ v0.2.37: Geometric Mean Scoring with Consideration System
+// ★ v0.2.49: PriorityBoost for escape actions (AoE/CC)
 using System;
 using Kingmaker.EntitySystem.Entities;
 using Kingmaker.UnitLogic.Abilities;
@@ -72,6 +73,9 @@ namespace CompanionAI_Pathfinder.Scoring
         /// <summary>Bonus score from special conditions (kill bonus, AoE, flanking, etc.)</summary>
         public float BonusScore { get; set; } = 0f;
 
+        /// <summary>★ v0.2.49: Priority boost for urgent actions (escape AoE, CC removal)</summary>
+        public float PriorityBoost { get; set; } = 0f;
+
         #endregion
 
         #region ★ v0.2.37: Geometric Mean Scoring
@@ -93,8 +97,9 @@ namespace CompanionAI_Pathfinder.Scoring
         public bool IsVetoed => Considerations.HasVeto;
 
         /// <summary>
-        /// 하이브리드 최종 점수 (Geometric Mean + Bonus)
-        /// GM 점수를 100배 스케일링 후 BonusScore 가산
+        /// 하이브리드 최종 점수 (Geometric Mean + Bonus + PriorityBoost)
+        /// GM 점수를 100배 스케일링 후 BonusScore/PriorityBoost 가산
+        /// ★ v0.2.49: PriorityBoost 추가 (위험 탈출 우선순위)
         /// Veto 시 -1000 반환
         /// </summary>
         public float HybridFinalScore
@@ -107,11 +112,11 @@ namespace CompanionAI_Pathfinder.Scoring
 
                 // Consideration이 없으면 기존 FinalScore 사용 (호환성)
                 if (Considerations.Count == 0)
-                    return FinalScore;
+                    return FinalScore + PriorityBoost;
 
-                // Geometric Mean을 100점 스케일로 변환 후 BonusScore 가산
+                // Geometric Mean을 100점 스케일로 변환 후 BonusScore + PriorityBoost 가산
                 float gmScore = GeometricScore * 100f;
-                return gmScore + BonusScore;
+                return gmScore + BonusScore + PriorityBoost;
             }
         }
 
@@ -134,11 +139,12 @@ namespace CompanionAI_Pathfinder.Scoring
 
         /// <summary>
         /// Final computed score used for action selection.
-        /// Formula: (Base × Effectiveness × Phase × Role) - ResourcePenalty + Bonus
+        /// Formula: (Base × Effectiveness × Phase × Role) - ResourcePenalty + Bonus + Priority
+        /// ★ v0.2.49: PriorityBoost 추가
         /// </summary>
         public float FinalScore =>
             (BaseScore * EffectivenessMultiplier * PhaseMultiplier * RoleMultiplier)
-            - ResourcePenalty + BonusScore;
+            - ResourcePenalty + BonusScore + PriorityBoost;
 
         /// <summary>Whether this is an attack action</summary>
         public bool IsAttack => ActionType == CandidateType.AbilityAttack || ActionType == CandidateType.BasicAttack;
@@ -335,14 +341,17 @@ namespace CompanionAI_Pathfinder.Scoring
             string targetStr = Target?.CharacterName ?? (MoveDestination.HasValue ? "position" : "none");
             string abilityStr = Ability?.Name ?? ActionType.ToString();
 
+            // ★ v0.2.49: PriorityBoost 표시 추가
+            string priorityStr = PriorityBoost > 0 ? $", Priority={PriorityBoost:F0}" : "";
+
             // ★ v0.2.37: Geometric Mean 정보 포함
             if (Considerations.Count > 0)
             {
-                return $"[{ActionType}] {abilityStr} -> {targetStr} (Hybrid={HybridFinalScore:F1}, GM={GeometricScore:F3}, Bonus={BonusScore:F1}{(IsVetoed ? ", VETOED" : "")})";
+                return $"[{ActionType}] {abilityStr} -> {targetStr} (Hybrid={HybridFinalScore:F1}, GM={GeometricScore:F3}, Bonus={BonusScore:F1}{priorityStr}{(IsVetoed ? ", VETOED" : "")})";
             }
 
             // 기존 포맷 (호환성)
-            return $"[{ActionType}] {abilityStr} -> {targetStr} (Score={FinalScore:F1}, Base={BaseScore:F0}, Eff={EffectivenessMultiplier:F2}, Phase={PhaseMultiplier:F2})";
+            return $"[{ActionType}] {abilityStr} -> {targetStr} (Score={FinalScore:F1}, Base={BaseScore:F0}, Eff={EffectivenessMultiplier:F2}, Phase={PhaseMultiplier:F2}{priorityStr})";
         }
 
         #endregion

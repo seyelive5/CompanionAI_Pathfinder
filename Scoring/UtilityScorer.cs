@@ -342,24 +342,27 @@ namespace CompanionAI_Pathfinder.Scoring
 
         /// <summary>
         /// Get top N candidates by score
+        /// ★ v0.2.42: HybridFinalScore 사용 (Geometric Mean 기반 선택과 일치)
         /// </summary>
         public List<ActionCandidate> GetTopCandidates(List<ActionCandidate> candidates, int count = 3)
         {
             if (candidates == null || candidates.Count == 0)
                 return new List<ActionCandidate>();
 
-            candidates.Sort((a, b) => b.FinalScore.CompareTo(a.FinalScore));
+            // ★ v0.2.42: HybridFinalScore로 정렬 (선택 로직과 동일)
+            candidates.Sort((a, b) => b.HybridFinalScore.CompareTo(a.HybridFinalScore));
             return candidates.GetRange(0, Math.Min(count, candidates.Count));
         }
 
         /// <summary>
         /// Log top candidates for debugging
+        /// ★ v0.2.42: HybridFinalScore 기반 로깅
         /// </summary>
         public void LogTopCandidates(List<ActionCandidate> candidates, string unitName, int count = 3)
         {
             var top = GetTopCandidates(candidates, count);
 
-            Main.Log($"[UtilityScorer] {unitName} Top {top.Count} decisions:");
+            Main.Log($"[UtilityScorer] {unitName} Top {top.Count} decisions (by HybridFinalScore):");
             for (int i = 0; i < top.Count; i++)
             {
                 var c = top[i];

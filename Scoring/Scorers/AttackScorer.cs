@@ -1,5 +1,6 @@
 // ★ v0.2.22: Unified Decision Engine - Attack Scorer
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
+// ★ v0.2.41: Charge ability distance penalty
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -167,6 +168,35 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             // ═══════════════════════════════════════════════════════════════
             bool hittable = situation.HittableEnemies?.Contains(candidate.Target) ?? true;
             cs.Add("Hittable", hittable ? 1.0f : 0.4f);
+
+            // ═══════════════════════════════════════════════════════════════
+            // ★ v0.2.41: 돌격(Charge) 거리 패널티
+            // 돌격은 최소 거리(10피트=3m) 요구 - 이미 근접하면 기본 공격이 더 나음
+            // ═══════════════════════════════════════════════════════════════
+            if (candidate.Ability != null && IsChargeAbility(candidate.Ability))
+            {
+                const float CHARGE_MIN_DISTANCE = 3.0f;  // ~10 feet
+                const float CHARGE_OPTIMAL_DISTANCE = 10.0f;  // 돌격에 이상적인 거리
+
+                if (distance < CHARGE_MIN_DISTANCE)
+                {
+                    // 이미 근접 - Veto (돌격 불가)
+                    cs.AddVeto("ChargeDistance", false);
+                    Main.Verbose($"[AttackScorer] Charge vetoed - too close (dist={distance:F1}m < {CHARGE_MIN_DISTANCE}m)");
+                }
+                else if (distance < CHARGE_OPTIMAL_DISTANCE)
+                {
+                    // 가깝지만 돌격 가능 - 패널티 부여 (기본 공격 선호)
+                    float chargeScore = (distance - CHARGE_MIN_DISTANCE) / (CHARGE_OPTIMAL_DISTANCE - CHARGE_MIN_DISTANCE);
+                    cs.Add("ChargeDistance", Mathf.Clamp(chargeScore, 0.3f, 1.0f));
+                    Main.Verbose($"[AttackScorer] Charge penalty applied (dist={distance:F1}m, score={chargeScore:F2})");
+                }
+                else
+                {
+                    // 충분히 멀다 - 돌격 보너스
+                    cs.Add("ChargeDistance", 1.0f);
+                }
+            }
 
             Main.Verbose($"[AttackScorer] {candidate.Ability?.Name ?? "BasicAttack"} -> {candidate.Target?.CharacterName}: {cs.ToDebugString()}");
         }
@@ -512,6 +542,40 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 count++;
 
             return count;
+        }
+
+        /// <summary>
+        /// ★ v0.2.41: 돌격(Charge) 능력인지 확인
+        /// 돌격은 최소 거리 요구가 있어서 특수 처리 필요
+        /// </summary>
+        private bool IsChargeAbility(AbilityData ability)
+        {
+            if (ability?.Blueprint == null)
+                return false;
+
+            try
+            {
+                // 이름 기반 감지 (다국어 지원)
+                string name = ability.Name?.ToLower() ?? "";
+                string bpName = ability.Blueprint.name?.ToLower() ?? "";
+
+                // 영어: charge
+                // 한국어: 돌격
+                if (name.Contains("charge") || name.Contains("돌격") ||
+                    bpName.Contains("charge"))
+                {
+                    return true;
+                }
+
+                // AbilityType이 CombatManeuver이고 Full Round인 경우도 Charge일 가능성
+                // (추가 검증 필요 시 구현)
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         #endregion
