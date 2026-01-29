@@ -121,6 +121,13 @@ namespace CompanionAI_Pathfinder.Settings
             ["CombatMode_None"] = new() { { Language.English, "Out of Combat" }, { Language.Korean, "전투 외" } },
             ["AITickCount"] = new() { { Language.English, "AI Tick Count" }, { Language.Korean, "AI Tick 횟수" } },
             ["ProcessedUnits"] = new() { { Language.English, "Processed Units" }, { Language.Korean, "처리된 유닛" } },
+
+            // ★ v0.2.38: Pre-Buff
+            ["PreBuffParty"] = new() { { Language.English, "Pre-Buff Party" }, { Language.Korean, "파티 버프 적용" } },
+            ["PreBuffPartyDesc"] = new() {
+                { Language.English, "Apply low-level buffs (level 1-2) to all party members" },
+                { Language.Korean, "모든 파티원에게 저레벨 버프(1-2레벨)를 적용합니다" }
+            },
         };
 
         public static string Get(string key)

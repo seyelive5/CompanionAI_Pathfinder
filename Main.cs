@@ -67,6 +67,9 @@ namespace CompanionAI_Pathfinder
                 // v0.2.2: 전투 이벤트 핸들러 구독
                 CombatEventHandler.Subscribe();
 
+                // ★ v0.2.38: Pre-Buff Controller 초기화
+                PreBuffController.Initialize();
+
                 Enabled = true;
                 Log($"CompanionAI Pathfinder v{modEntry.Info.Version} 로드 완료!");
 

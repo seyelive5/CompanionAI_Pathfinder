@@ -19,6 +19,7 @@ namespace CompanionAI_Pathfinder.GameInterface
     public static class CustomBrainPatch
     {
         private static int _tickCounter = 0;
+        private static int _lastPreBuffFrame = 0;  // ★ v0.2.38: PreBuff tick tracking
 
         /// <summary>
         /// AiBrainController.TickBrain() 패치
@@ -33,6 +34,14 @@ namespace CompanionAI_Pathfinder.GameInterface
             {
                 Main.TickCount++;
                 _tickCounter++;
+
+                // ★ v0.2.38: PreBuffController tick (프레임당 1회)
+                int currentFrame = UnityEngine.Time.frameCount;
+                if (currentFrame != _lastPreBuffFrame)
+                {
+                    _lastPreBuffFrame = currentFrame;
+                    PreBuffController.Instance?.Tick();
+                }
 
                 // 모드가 비활성화되어 있으면 원본 실행
                 if (!Main.Enabled)

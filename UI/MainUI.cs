@@ -5,6 +5,7 @@ using Kingmaker;
 using Kingmaker.EntitySystem.Entities;
 using UnityEngine;
 using CompanionAI_Pathfinder.Settings;
+using CompanionAI_Pathfinder.GameInterface;
 
 namespace CompanionAI_Pathfinder.UI
 {
@@ -119,6 +120,16 @@ namespace CompanionAI_Pathfinder.UI
             // 통계
             GUILayout.Label($"{L("AITickCount")}: <color=#00BFFF>{Main.TickCount}</color>");
             GUILayout.Label($"{L("ProcessedUnits")}: <color=#00BFFF>{Main.ProcessedUnits}</color>");
+
+            // ★ v0.2.38: Pre-Buff 버튼
+            GUILayout.Space(10);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button($"<color=#FFD700><b>⚔ {L("PreBuffParty")}</b></color>", GUILayout.Width(200), GUILayout.Height(35)))
+            {
+                PreBuffController.TriggerPartyBuff();
+            }
+            GUILayout.Label($"<color=#888888><size=11>{L("PreBuffPartyDesc")}</size></color>", _descriptionStyle);
+            GUILayout.EndHorizontal();
 
             GUILayout.EndVertical();
         }

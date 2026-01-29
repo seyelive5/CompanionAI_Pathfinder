@@ -22,6 +22,7 @@ namespace CompanionAI_Pathfinder.Analysis
     /// <summary>
     /// v0.2.5: 능력이 적용하는 모든 버프 효과 (BubbleBuffs 패턴)
     /// 단일 능력이 여러 버프를 적용할 수 있음
+    /// v0.2.40: 인챈트 주문 감지 추가
     /// </summary>
     public class AbilityBuffEffects
     {
@@ -38,13 +39,27 @@ namespace CompanionAI_Pathfinder.Analysis
         public bool IsLongDuration { get; private set; }
 
         /// <summary>버프가 없는지</summary>
-        public bool IsEmpty => AppliedBuffGuids.Count == 0;
+        public bool IsEmpty => AppliedBuffGuids.Count == 0 && !IsEnchantment;
 
         /// <summary>v0.2.18: 발견된 세이브 타입</summary>
         public SavingThrowType? DetectedSaveType { get; set; }
 
         /// <summary>첫 번째 버프 (레거시 호환)</summary>
         public BlueprintBuff PrimaryBuff => AppliedBuffs.Count > 0 ? AppliedBuffs[0] : null;
+
+        /// <summary>★ v0.2.40: 인챈트 주문 여부 (Magic Weapon, Greater Magic Weapon 등)</summary>
+        public bool IsEnchantment { get; private set; }
+
+        /// <summary>★ v0.2.40: 인챈트 보너스 (탐지된 경우)</summary>
+        public int EnchantmentBonus { get; private set; }
+
+        /// <summary>★ v0.2.40: 인챈트 설정</summary>
+        public void SetEnchantment(int bonus = 0)
+        {
+            IsEnchantment = true;
+            if (bonus > EnchantmentBonus)
+                EnchantmentBonus = bonus;
+        }
 
         /// <summary>
         /// 버프 추가
@@ -534,6 +549,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 재귀적으로 모든 버프 수집 (반환 대신 수집)
+        /// ★ v0.2.40: 인챈트 주문 감지 추가 (EnhanceWeapon, ContextActionEnchantWornItem)
         /// </summary>
         private static void CollectBuffsRecursive(GameAction[] actions, AbilityBuffEffects effects, int depth)
         {
@@ -552,6 +568,20 @@ namespace CompanionAI_Pathfinder.Analysis
                     bool isLong = IsLongDuration(applyBuff);
                     effects.AddBuff(applyBuff.Buff, isPermanent, isLong);
                     continue; // 계속 탐색 (다른 버프도 있을 수 있음)
+                }
+
+                // ★ v0.2.40: 인챈트 주문 감지 (타입명 기반)
+                // EnhanceWeapon, ContextActionEnchantWornItem 등은 버프가 아닌 인챈트
+                string actionTypeName = action.GetType().Name;
+                if (actionTypeName.Contains("EnchantWornItem") ||
+                    actionTypeName.Contains("EnhanceWeapon") ||
+                    actionTypeName.Contains("ItemEnchantment"))
+                {
+                    // 인챈트 보너스 추출 시도
+                    int bonus = TryExtractEnchantmentBonus(action);
+                    effects.SetEnchantment(bonus);
+                    Main.Verbose($"[AbilityClassifier] Detected enchantment action: {actionTypeName}, bonus={bonus}");
+                    continue;
                 }
 
                 // Conditional (IfTrue / IfFalse)
@@ -597,6 +627,56 @@ namespace CompanionAI_Pathfinder.Analysis
                     CollectBuffsRecursive(partyMembers.Action?.Actions, effects, depth + 1);
                 }
             }
+        }
+
+        /// <summary>
+        /// ★ v0.2.40: 인챈트 보너스 추출 시도 (Reflection)
+        /// </summary>
+        private static int TryExtractEnchantmentBonus(GameAction action)
+        {
+            try
+            {
+                // EnchantmentBonus, Enhancement, Bonus 등의 필드 탐색
+                var type = action.GetType();
+
+                // 일반적인 필드명 시도
+                foreach (var fieldName in new[] { "EnchantmentBonus", "Enhancement", "Bonus", "m_EnhancementBonus" })
+                {
+                    var field = type.GetField(fieldName,
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Instance);
+
+                    if (field != null)
+                    {
+                        var value = field.GetValue(action);
+                        if (value is int intVal)
+                            return intVal;
+                    }
+                }
+
+                // 프로퍼티도 시도
+                foreach (var propName in new[] { "EnchantmentBonus", "Enhancement", "Bonus" })
+                {
+                    var prop = type.GetProperty(propName,
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Instance);
+
+                    if (prop != null)
+                    {
+                        var value = prop.GetValue(action);
+                        if (value is int intVal)
+                            return intVal;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Verbose($"[AbilityClassifier] TryExtractEnchantmentBonus error: {ex.Message}");
+            }
+
+            return 1; // 기본 +1 보너스
         }
 
         /// <summary>
@@ -749,11 +829,13 @@ namespace CompanionAI_Pathfinder.Analysis
                 Main.Error($"[AbilityClassifier] Enhanced classification error for {ability?.Name}: {ex.Message}");
             }
 
-            // v0.2.5: Check if any buff is already applied (다중 버프 지원)
-            if (caster != null && !buffEffects.IsEmpty)
-            {
-                result.IsAlreadyApplied = buffEffects.IsAnyBuffPresent(caster);
-            }
+            // ★ v0.2.40: REMOVED - IsAlreadyApplied should be checked per TARGET, not caster
+            // The caster parameter is NOT the buff target. For ally buffs, we must check
+            // each potential target individually. BuffScorer.IsBuffAlreadyApplied() does this correctly.
+            // Setting this field here was a bug that caused permanent buffs to be skipped
+            // when the CASTER (not target) already had the buff.
+            // result.IsAlreadyApplied is now always false from classification;
+            // actual check happens in BuffScorer.BuildBuffConsiderations() per target.
 
             // v0.2.18: 세이브 타입 전파
             if (buffEffects.DetectedSaveType.HasValue)

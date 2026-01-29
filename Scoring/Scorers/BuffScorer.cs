@@ -1,6 +1,8 @@
 // ★ v0.2.22: Unified Decision Engine - Buff/Heal Scorer
 // ★ v0.2.36: Enhanced heal target selection with role-based priority
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
+// ★ v0.2.39: 버프 전투 가치 분석 (CombatValue Consideration)
+// ★ v0.2.40: 인챈트 주문 지원 및 IsAlreadyApplied 버그 수정
 using System;
 using System.Linq;
 using Kingmaker.EntitySystem.Entities;
@@ -424,6 +426,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// 버프 행동에 대한 Consideration 구축
+        /// ★ v0.2.39: CombatValue consideration 추가
         /// </summary>
         private void BuildBuffConsiderations(ActionCandidate candidate, Situation situation,
             UnitEntityData target, bool isSelf, PhaseRoleWeights weights)
@@ -443,18 +446,32 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             cs.Add("NotAlreadyBuffed", alreadyBuffed ? 0.1f : 1.0f);
 
             // ═══════════════════════════════════════════════════════════════
-            // 2. 전투 페이즈 적합성
+            // 2. ★ v0.2.39: 버프 전투 가치 (핵심 Consideration)
+            // Guidance(스킬+1) vs Shield of Faith(AC+2) 차별화
             // ═══════════════════════════════════════════════════════════════
-            cs.Add("PhaseFit", ScoreNormalizer.BuffPhaseFit(situation.CombatPhase));
+            float combatValue = GetBuffCombatValue(candidate);
+            cs.Add("CombatValue", ScoreNormalizer.BuffCombatValue(combatValue));
 
             // ═══════════════════════════════════════════════════════════════
-            // 3. 역할 적합성
+            // 3. 전투 페이즈 적합성
+            // ★ v0.2.39: 전투 가치가 낮은 버프는 Opening 보너스 감소
+            // ═══════════════════════════════════════════════════════════════
+            float phaseFit = ScoreNormalizer.BuffPhaseFit(situation.CombatPhase);
+            if (combatValue < 0.3f && situation.CombatPhase == CombatPhase.Opening)
+            {
+                // 유틸리티 버프는 Opening에서도 낮은 적합성
+                phaseFit *= 0.3f;
+            }
+            cs.Add("PhaseFit", phaseFit);
+
+            // ═══════════════════════════════════════════════════════════════
+            // 4. 역할 적합성
             // ═══════════════════════════════════════════════════════════════
             var role = situation.CharacterSettings?.Role ?? AIRole.DPS;
             cs.Add("RoleFit", ScoreNormalizer.RoleActionFit(role, CandidateType.Buff));
 
             // ═══════════════════════════════════════════════════════════════
-            // 4. 버프 스택 가치 (이미 많은 버프 → 낮은 가치)
+            // 5. 버프 스택 가치 (이미 많은 버프 → 낮은 가치)
             // ★ v0.2.37 fix: 최소 0.25 유지하여 Veto 방지
             // ═══════════════════════════════════════════════════════════════
             int currentBuffs = CountActiveBuffs(target);
@@ -464,14 +481,14 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             cs.Add("BuffStackValue", Mathf.Clamp(normalizedStackValue, 0.25f, 1.0f));
 
             // ═══════════════════════════════════════════════════════════════
-            // 5. 타겟 HP (죽어가는 아군에게 버프 낭비 방지)
+            // 6. 타겟 HP (죽어가는 아군에게 버프 낭비 방지)
             // ═══════════════════════════════════════════════════════════════
             float targetHP = GetHPPercent(target);
             float hpFactor = targetHP > 70f ? 1f : (targetHP > 30f ? 0.6f : 0.2f);
             cs.Add("TargetHP", hpFactor);
 
             // ═══════════════════════════════════════════════════════════════
-            // 6. 리소스 가용성
+            // 7. 리소스 가용성
             // ═══════════════════════════════════════════════════════════════
             if (candidate.Classification != null)
             {
@@ -484,12 +501,12 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
 
             // ═══════════════════════════════════════════════════════════════
-            // 7. 첫 행동 보너스 (버프 후 공격이 효율적)
+            // 8. 첫 행동 보너스 (버프 후 공격이 효율적)
             // ═══════════════════════════════════════════════════════════════
             float firstActionBonus = (!situation.HasPerformedFirstAction && !situation.HasBuffedThisTurn) ? 1f : 0.7f;
             cs.Add("FirstAction", firstActionBonus);
 
-            Main.Verbose($"[BuffScorer] Buff {candidate.Ability?.Name} -> {target.CharacterName}: {cs.ToDebugString()}");
+            Main.Verbose($"[BuffScorer] Buff {candidate.Ability?.Name} -> {target.CharacterName}: Combat={combatValue:F2}, {cs.ToDebugString()}");
         }
 
         #endregion
@@ -560,6 +577,63 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             int level = candidate.Classification.SpellLevel;
             // Heal scales with spell level
             return 10f + level * 8f;
+        }
+
+        /// <summary>
+        /// ★ v0.2.39: 버프의 전투 가치 조회
+        /// ★ v0.2.40: 인챈트 주문 지원 추가
+        /// BuffEffectAnalyzer를 사용하여 버프의 실제 전투 효과 분석
+        /// </summary>
+        private float GetBuffCombatValue(ActionCandidate candidate)
+        {
+            try
+            {
+                // ★ v0.2.40: AbilityClassifier에서 버프/인챈트 정보 추출
+                AbilityBuffEffects buffEffects = null;
+                if (candidate.Ability != null)
+                {
+                    buffEffects = AbilityClassifier.GetBuffEffects(candidate.Ability);
+
+                    // ★ v0.2.40: 인챈트 주문은 높은 전투 가치 (무기 강화)
+                    if (buffEffects != null && buffEffects.IsEnchantment)
+                    {
+                        // 인챈트 보너스에 따른 가치: +1 = 0.9, +2 = 0.95, +3+ = 1.0
+                        float enchantValue = 0.85f + buffEffects.EnchantmentBonus * 0.05f;
+                        enchantValue = Mathf.Clamp(enchantValue, 0.85f, 1.0f);
+
+                        Main.Verbose($"[BuffScorer] {candidate.Ability?.Name} -> Enchantment +{buffEffects.EnchantmentBonus}, CombatValue={enchantValue:F2}");
+                        return enchantValue;
+                    }
+                }
+
+                // 1. Classification에서 AppliedBuff 확인
+                var buff = candidate.Classification?.AppliedBuff;
+
+                // 2. 없으면 buffEffects에서 추출
+                if (buff == null && buffEffects != null)
+                {
+                    buff = buffEffects.PrimaryBuff;
+                }
+
+                // 3. 버프가 없으면 중간값 반환
+                if (buff == null)
+                {
+                    Main.Verbose($"[BuffScorer] No buff found for {candidate.Ability?.Name}, using default combat value");
+                    return 0.3f;
+                }
+
+                // 4. BuffEffectAnalyzer로 전투 가치 분석
+                float combatValue = BuffEffectAnalyzer.GetCombatValue(buff);
+
+                Main.Verbose($"[BuffScorer] {candidate.Ability?.Name} -> Buff={buff.Name ?? "?"}, CombatValue={combatValue:F2}");
+
+                return combatValue;
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[BuffScorer] GetBuffCombatValue error: {ex.Message}");
+                return 0.3f;  // 에러 시 중간값
+            }
         }
 
         #endregion

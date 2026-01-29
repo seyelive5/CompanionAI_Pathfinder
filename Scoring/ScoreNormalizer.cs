@@ -331,6 +331,29 @@ namespace CompanionAI_Pathfinder.Scoring
         }
 
         /// <summary>
+        /// ★ v0.2.39: 버프 전투 가치 정규화
+        /// BuffEffectAnalyzer의 원시 전투 가치를 Consideration에 적합한 값으로 변환
+        /// </summary>
+        /// <param name="rawCombatValue">BuffEffectAnalyzer에서 반환한 값 (0.05 ~ 1.0)</param>
+        /// <returns>정규화된 값 (0.1 ~ 1.0) - Veto 방지를 위해 최소 0.1 보장</returns>
+        public static float BuffCombatValue(float rawCombatValue)
+        {
+            // 전투 가치 매핑:
+            // - 1.0 (AC/Attack/Damage) → 1.0
+            // - 0.8 (Stat bonuses) → 0.82
+            // - 0.7 (Temp HP) → 0.73
+            // - 0.6 (Resistances) → 0.64
+            // - 0.4 (Healing over time) → 0.46
+            // - 0.1 (Skill only) → 0.19
+            // - 0.05 (Utility) → 0.145
+
+            // 선형 매핑: 0.05~1.0 → 0.1~1.0
+            // 최소 floor 0.1 보장하여 soft-veto 방지
+            float normalized = 0.1f + rawCombatValue * 0.9f;
+            return Mathf.Clamp(normalized, 0.1f, 1.0f);
+        }
+
+        /// <summary>
         /// 힐링 행동의 페이즈 적합성
         /// </summary>
         public static float HealPhaseFit(CombatPhase phase)
