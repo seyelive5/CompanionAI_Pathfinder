@@ -1,0 +1,84 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>CompanionAI_Pathfinder</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <!-- Mods 폴더로 직접 빌드 -->
+    <OutputPath>C:\Program Files (x86)\Steam\steamapps\common\Pathfinder Second Adventure\Mods\CompanionAI_Pathfinder\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Pathfinder: Wrath of the Righteous install path -->
+    <GamePath>C:\Program Files (x86)\Steam\steamapps\common\Pathfinder Second Adventure</GamePath>
+    <ManagedPath>$(GamePath)\Wrath_Data\Managed</ManagedPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Unity Engine -->
+    <Reference Include="UnityEngine">
+      <HintPath>$(ManagedPath)\UnityEngine.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(ManagedPath)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(ManagedPath)\UnityEngine.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(ManagedPath)\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(ManagedPath)\UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- Game Assemblies -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(ManagedPath)\Assembly-CSharp.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Owlcat.Runtime.Core">
+      <HintPath>$(ManagedPath)\Owlcat.Runtime.Core.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Owlcat.Runtime.UI">
+      <HintPath>$(ManagedPath)\Owlcat.Runtime.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- Pathfinding -->
+    <Reference Include="AstarPathfindingProject">
+      <HintPath>$(ManagedPath)\AstarPathfindingProject.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- Unity Mod Manager -->
+    <Reference Include="UnityModManager">
+      <HintPath>$(ManagedPath)\UnityModManager\UnityModManager.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- Harmony (game already includes 0Harmony.dll) -->
+    <PackageReference Include="Lib.Harmony" Version="2.2.2">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+
+    <!-- Json -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <!-- Info.json 자동 복사 -->
+  <ItemGroup>
+    <None Include="Info.json" CopyToOutputDirectory="Always" />
+  </ItemGroup>
+
+</Project>

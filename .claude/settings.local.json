@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(cd:*)",
+      "Bash(ls -la \"C:\\\\Users\\\\veria\\\\Downloads\"\" | grep -i \"v3|companion \")",
+      "Bash(wc:*)",
+      "Bash(\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" CompanionAI_Pathfinder.csproj /p:Configuration=Release /v:minimal /nologo)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe\" CompanionAI_Pathfinder.csproj /p:Configuration=Release /v:minimal /nologo)",
+      "Bash(dotnet build:*)",
+      "Bash(\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"C:\\\\Users\\\\veria\\\\Downloads\\\\CompanionAI_Pathfinder\\\\CompanionAI_Pathfinder.csproj\" /p:Configuration=Release /v:minimal /nologo)",
+      "Bash(powershell -Command:*)",
+      "Bash(findstr:*)",
+      "Bash(cmd /c \"\"\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\"\" \"\"C:\\\\Users\\\\veria\\\\Downloads\\\\CompanionAI_Pathfinder\\\\CompanionAI_Pathfinder.csproj\"\" /p:Configuration=Release /v:minimal /nologo\")",
+      "Bash(git init:*)",
+      "Bash(git config:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
