@@ -347,6 +347,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 자가 해제 능력 보유 확인
+        /// ★ v0.2.62: AbilityClassifier.GetCCRemovalInfo() 사용 (문자열 검색 제거)
         /// </summary>
         private static bool HasSelfRemovalAbility(UnitEntityData unit, UnitCondition condition)
         {
@@ -363,29 +364,10 @@ namespace CompanionAI_Pathfinder.Analysis
                     if (blueprint == null)
                         continue;
 
-                    // Freedom of Movement - 이동 방해 해제
-                    if (blueprint.name?.Contains("FreedomOfMovement") == true)
-                    {
-                        if (condition == UnitCondition.Entangled ||
-                            condition == UnitCondition.CantMove ||
-                            condition == UnitCondition.MovementBan)
-                            return true;
-                    }
-
-                    // Remove Fear - 공포 해제
-                    if (blueprint.name?.Contains("RemoveFear") == true)
-                    {
-                        if (condition == UnitCondition.Frightened ||
-                            condition == UnitCondition.Shaken)
-                            return true;
-                    }
-
-                    // Remove Paralysis - 마비 해제
-                    if (blueprint.name?.Contains("RemoveParalysis") == true)
-                    {
-                        if (condition == UnitCondition.Paralyzed)
-                            return true;
-                    }
+                    // ★ v0.2.62: 캐시된 CC 해제 정보 사용
+                    var removalInfo = AbilityClassifier.GetCCRemovalInfo(blueprint);
+                    if (removalInfo != null && removalInfo.CanRemove(condition))
+                        return true;
                 }
             }
             catch { }
@@ -395,6 +377,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// CC 해제 능력 보유 확인 (타겟 지정용)
+        /// ★ v0.2.62: AbilityClassifier.GetCCRemovalInfo() 사용 (문자열 검색 제거)
         /// </summary>
         private static bool HasRemovalAbility(UnitEntityData caster, UnitEntityData target)
         {
@@ -411,22 +394,24 @@ namespace CompanionAI_Pathfinder.Analysis
                     if (blueprint == null)
                         continue;
 
-                    string name = blueprint.name ?? "";
+                    // ★ v0.2.62: 캐시된 CC 해제 정보 사용
+                    var removalInfo = AbilityClassifier.GetCCRemovalInfo(blueprint);
+                    if (removalInfo == null)
+                        continue;
 
-                    // 주요 해제 주문들
-                    if (name.Contains("RemoveFear") ||
-                        name.Contains("RemoveParalysis") ||
-                        name.Contains("RemoveDisease") ||
-                        name.Contains("RemoveCurse") ||
-                        name.Contains("DispelMagic") ||
-                        name.Contains("BreakEnchantment") ||
-                        name.Contains("Restoration") ||
-                        name.Contains("Heal"))
-                    {
-                        // 시전 가능한지 확인 (간단히)
-                        if (abilityData.IsAvailable)
-                            return true;
-                    }
+                    // 어떤 종류든 CC 해제 가능하면 true
+                    bool hasAnyRemoval = removalInfo.RemovesFear ||
+                                         removalInfo.RemovesParalysis ||
+                                         removalInfo.RemovesMovement ||
+                                         removalInfo.RemovesDisease ||
+                                         removalInfo.RemovesCurse ||
+                                         removalInfo.RemovesPoison ||
+                                         removalInfo.RemovesAny ||
+                                         removalInfo.IsRestoration ||
+                                         removalInfo.IsHeal;
+
+                    if (hasAnyRemoval && abilityData.IsAvailable)
+                        return true;
                 }
             }
             catch { }
@@ -512,6 +497,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 자가 해제 능력 찾기
+        /// ★ v0.2.62: AbilityClassifier.GetCCRemovalInfo() 사용 (문자열 검색 제거)
         /// </summary>
         private static AbilityData FindSelfRemovalAbility(UnitEntityData unit, List<ActiveCC> activeCCs)
         {
@@ -531,41 +517,15 @@ namespace CompanionAI_Pathfinder.Analysis
                     if (blueprint == null)
                         continue;
 
-                    string name = blueprint.name ?? "";
+                    // ★ v0.2.62: 캐시된 CC 해제 정보 사용
+                    var removalInfo = AbilityClassifier.GetCCRemovalInfo(blueprint);
+                    if (removalInfo == null)
+                        continue;
 
                     // 현재 CC에 맞는 해제 능력 찾기
                     foreach (var cc in activeCCs)
                     {
-                        bool matches = false;
-
-                        switch (cc.Condition)
-                        {
-                            case UnitCondition.Frightened:
-                            case UnitCondition.Shaken:
-                                matches = name.Contains("RemoveFear");
-                                break;
-
-                            case UnitCondition.Paralyzed:
-                                matches = name.Contains("RemoveParalysis");
-                                break;
-
-                            case UnitCondition.Entangled:
-                            case UnitCondition.CantMove:
-                            case UnitCondition.MovementBan:
-                                matches = name.Contains("FreedomOfMovement");
-                                break;
-
-                            case UnitCondition.Nauseated:
-                            case UnitCondition.Sickened:
-                                matches = name.Contains("RemoveDisease") || name.Contains("Restoration");
-                                break;
-
-                            case UnitCondition.Confusion:
-                                matches = name.Contains("BreakEnchantment") || name.Contains("DispelMagic");
-                                break;
-                        }
-
-                        if (matches)
+                        if (removalInfo.CanRemove(cc.Condition))
                             return abilityData;
                     }
                 }

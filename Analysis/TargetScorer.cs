@@ -1,9 +1,12 @@
 // ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
+// ★ v0.2.56: 적 위협 감지 개선 - 명령 타겟 분석
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using Kingmaker.EntitySystem.Entities;
 using Kingmaker.EntitySystem.Stats;
+using Kingmaker.UnitLogic.Commands;
+using Kingmaker.UnitLogic.Commands.Base;
 using UnityEngine;
 using CompanionAI_Pathfinder.Settings;
 using CompanionAI_Pathfinder.Scoring;
@@ -77,15 +80,34 @@ namespace CompanionAI_Pathfinder.Analysis
 
         #endregion
 
-        #region AIRole-based Scoring
+        #region ★ v0.2.55: 통합 스코어링
+
+        // Support 아군 타겟 가중치
+        public static readonly AllyWeights SupportAllyWeights = new AllyWeights
+        {
+            HPPercent = 1.0f,     // 매우 높음 - 낮은 HP 우선 힐
+            Distance = 0.3f,      // 낮음 - 거리 무시 (힐 사거리 김)
+            MissingHP = 0.7f      // 높음 - 손실량 많을수록 우선
+        };
 
         /// <summary>
-        /// AIRole 기반 적 타겟 점수 계산
-        /// RealTimeController에서 사용
-        /// v0.2.17: 킬 확정 보너스, 적 역할 감지 추가
-        /// ★ v0.2.52: TargetAnalyzer 통합
+        /// ★ v0.2.55: 통합 적 타겟 스코어링
+        /// 모든 호출처(RealTimeController, SelectBestEnemy, AttackScorer)에서 사용
+        ///
+        /// AIRole과 RangePreference 모두 지원:
+        /// - Tank = Melee
+        /// - DPS = Mixed
+        /// - Support = Ranged
         /// </summary>
-        public static float ScoreTarget(UnitEntityData attacker, UnitEntityData target, AIRole role)
+        /// <param name="attacker">공격자 유닛</param>
+        /// <param name="target">타겟 유닛</param>
+        /// <param name="role">AIRole (RangePreference로 변환됨)</param>
+        /// <param name="situation">선택적 Situation (Hittable 체크용)</param>
+        public static float ScoreEnemyUnified(
+            UnitEntityData attacker,
+            UnitEntityData target,
+            AIRole role,
+            Situation situation = null)
         {
             if (target == null || attacker == null) return -1000f;
 
@@ -95,66 +117,280 @@ namespace CompanionAI_Pathfinder.Analysis
             }
             catch { }
 
+            // AIRole → EnemyWeights
             var weights = GetWeightsForRole(role);
+            bool isTank = (role == AIRole.Tank);
             float score = 50f;
 
             try
             {
-                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                // ★ 통합 분석 획득 (캐시됨)
                 var analysis = TargetAnalyzer.Analyze(target, attacker);
 
-                // 1. HP% 점수 (낮을수록 높음)
+                // ═══════════════════════════════════════════════════════════════
+                // 1. HP 점수 (낮을수록 높음 - 마무리 타겟 우선)
+                // ═══════════════════════════════════════════════════════════════
                 float hpPercent = analysis?.HPPercent ?? 100f;
                 float hpScore = (100f - hpPercent) * 0.5f;
                 score += hpScore * weights.HPPercent;
 
-                // 2. 거리 점수
+                // ═══════════════════════════════════════════════════════════════
+                // 2. 거리 점수 - ★ v0.2.56: Tank 거리 보너스 확대
+                // ═══════════════════════════════════════════════════════════════
                 float distance = GetDistance(attacker, target);
                 float distanceScore = -distance * 2f;
 
-                if (role == AIRole.Tank && distance <= 5f)
-                    distanceScore += 30f;
+                // ★ v0.2.56: Tank(Melee)는 단계별 거리 보너스 (가까울수록 높음)
+                if (isTank)
+                {
+                    if (distance <= 3f)
+                        distanceScore += 50f;       // 즉시 공격 가능
+                    else if (distance <= 6f)
+                        distanceScore += 40f;       // 한 걸음이면 도달
+                    else if (distance <= 10f)
+                        distanceScore += 25f;       // 가까운 편
+                    else if (distance <= 15f)
+                        distanceScore += 10f;       // 중거리
+                    // 15m 이상은 보너스 없음
+                }
 
                 score += distanceScore * weights.Distance;
 
-                // 3. 위협도 평가 - ★ v0.2.52: TargetAnalyzer 사용
+                // ═══════════════════════════════════════════════════════════════
+                // 3. Hittable 여부 (Situation 있을 때만)
+                // ═══════════════════════════════════════════════════════════════
+                if (situation != null)
+                {
+                    bool isHittable = situation.HittableEnemies?.Contains(target) ?? false;
+                    if (isHittable)
+                        score += 25f * weights.Hittable;
+                    else
+                        score -= 15f;
+                }
+
+                // ═══════════════════════════════════════════════════════════════
+                // 4. 위협도 (TargetAnalyzer)
+                // ═══════════════════════════════════════════════════════════════
                 float threat = analysis?.ThreatLevel ?? 0.5f;
                 score += threat * 30f * weights.Threat;
 
-                // 4. v0.2.17: 킬 확정 보너스 - HP가 매우 낮으면 마무리 우선
+                // ═══════════════════════════════════════════════════════════════
+                // 5. 킬 확정 보너스 - HP가 매우 낮으면 마무리 우선
+                // ═══════════════════════════════════════════════════════════════
                 if (hpPercent <= 20f)
                     score += 25f;
                 else if (hpPercent <= 35f)
                     score += 12f;
 
-                // 5. v0.2.17: 적 역할 보너스 - 캐스터/힐러 우선 타겟팅
+                // ═══════════════════════════════════════════════════════════════
+                // 6. 적 역할 보너스 - 캐스터/힐러 우선 타겟팅
+                // ═══════════════════════════════════════════════════════════════
                 float roleBonus = EvaluateEnemyRolePriority(target);
                 score += roleBonus;
 
-                // 6. v0.2.18: AC 기반 타겟팅 - 물리 공격자만 - ★ v0.2.52: TargetAnalyzer 사용
+                // ═══════════════════════════════════════════════════════════════
+                // 7. AC 기반 타겟팅 - 물리 공격자만
+                // ═══════════════════════════════════════════════════════════════
                 if (IsPhysicalAttacker(attacker))
                 {
                     int targetAC = analysis?.AC ?? 20;
-                    float acScore = (30f - targetAC) * 1.0f; // AC 10→+20, AC 30→0, AC 40→-10
+                    float acScore = (30f - targetAC) * 1.0f;
                     score += acScore * weights.ACVulnerability;
-                    Main.Verbose($"[TargetScorer] {target.CharacterName}: AC={targetAC}, acBonus={acScore * weights.ACVulnerability:F1}");
                 }
 
-                // 7. v0.2.18: 플랭킹 보너스 - ★ v0.2.52: TargetAnalyzer 사용
+                // ═══════════════════════════════════════════════════════════════
+                // 8. 플랭킹 보너스
+                // ═══════════════════════════════════════════════════════════════
                 if (analysis?.IsFlanked ?? false)
                 {
-                    score += 15f; // 플랭킹 = 공격 +2 보너스 반영
-                    if (HasSneakAttack(attacker))
-                        score += 30f; // 스닉 어택 보유 시 플랭킹 적 극우선
-                    Main.Verbose($"[TargetScorer] {target.CharacterName}: FLANKED bonus, sneakAtk={HasSneakAttack(attacker)}");
+                    score += 15f;
+                    bool hasSneakAttack = situation?.HasSneakAttack ?? HasSneakAttack(attacker);
+                    if (hasSneakAttack)
+                        score += 30f;
+                }
+
+                // ═══════════════════════════════════════════════════════════════
+                // 9. ★ v0.2.56: Tank 전용 - 아군 위협 감지 (확장)
+                //    - EngagedUnits: 근접 교전 중인 아군 (기존)
+                //    - 명령 타겟: 적이 현재 공격 중인 아군 (신규)
+                //    - 접근 중: 적이 아군에게 이동 중 (신규)
+                // ═══════════════════════════════════════════════════════════════
+                if (isTank)
+                {
+                    // 1. 기존: 근접 교전 중인 아군
+                    int alliesEngaged = CountAlliesEngaged(target, attacker, situation);
+
+                    // 2. 신규: 적의 현재 명령 타겟이 아군인지
+                    bool isTargetingAlly = IsEnemyTargetingAlly(target, attacker, situation);
+
+                    // 3. 신규: 적이 아군 방향으로 접근 중인지
+                    bool isApproachingAllies = IsEnemyApproachingAllies(target, attacker, situation);
+
+                    float tankBonus = 0f;
+
+                    if (alliesEngaged > 0)
+                    {
+                        tankBonus += alliesEngaged * 15f;  // 아군 1명당 +15점 (최우선)
+                    }
+
+                    if (isTargetingAlly)
+                    {
+                        tankBonus += 25f;  // 아군 공격 중 +25점
+                    }
+
+                    if (isApproachingAllies && tankBonus == 0)
+                    {
+                        tankBonus += 12f;  // 접근 중 +12점 (다른 보너스 없을 때만)
+                    }
+
+                    if (tankBonus > 0)
+                    {
+                        score += tankBonus;
+                        Main.Verbose($"[TargetScorer] {target.CharacterName}: Tank threat bonus (engaged={alliesEngaged}, targeting={isTargetingAlly}, approaching={isApproachingAllies}) +{tankBonus:F0}");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Main.Verbose($"[TargetScorer] ScoreTarget error: {ex.Message}");
+                Main.Verbose($"[TargetScorer] ScoreEnemyUnified error: {ex.Message}");
             }
 
             return score;
+        }
+
+        /// <summary>
+        /// ★ v0.2.55: 통합 아군 교전 카운트
+        /// Situation이 있으면 situation.Allies 사용, 없으면 IsAlly() 사용
+        /// </summary>
+        private static int CountAlliesEngaged(UnitEntityData enemy, UnitEntityData attacker, Situation situation)
+        {
+            try
+            {
+                var engagedUnits = enemy?.CombatState?.EngagedUnits;
+                if (engagedUnits == null || engagedUnits.Count == 0) return 0;
+
+                int count = 0;
+
+                if (situation?.Allies != null)
+                {
+                    // Situation 있으면 Allies 리스트 사용
+                    foreach (var engaged in engagedUnits)
+                    {
+                        if (engaged != null && situation.Allies.Contains(engaged))
+                            count++;
+                    }
+                }
+                else
+                {
+                    // Situation 없으면 IsAlly() 사용
+                    foreach (var engaged in engagedUnits)
+                    {
+                        if (engaged != null && engaged != attacker && engaged.IsAlly(attacker))
+                            count++;
+                    }
+                }
+                return count;
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// ★ v0.2.56: 적이 현재 아군을 타겟팅하는지 확인
+        /// 적의 현재 명령에서 타겟을 추출하여 아군인지 확인
+        /// </summary>
+        private static bool IsEnemyTargetingAlly(UnitEntityData enemy, UnitEntityData attacker, Situation situation)
+        {
+            try
+            {
+                if (enemy?.Commands == null) return false;
+
+                var rawCommands = enemy.Commands.Raw;
+                if (rawCommands == null) return false;
+
+                foreach (var cmd in rawCommands)
+                {
+                    if (cmd == null || cmd.IsFinished) continue;
+
+                    // UnitUseAbility 명령에서 타겟 추출
+                    if (cmd is UnitUseAbility useAbilityCmd)
+                    {
+                        var target = useAbilityCmd.Target?.Unit;
+                        if (target != null && IsAllyUnit(target, attacker, situation))
+                        {
+                            return true;
+                        }
+                    }
+                    // UnitAttack 명령에서 타겟 추출
+                    else if (cmd is UnitAttack attackCmd)
+                    {
+                        var target = attackCmd.Target;
+                        if (target != null && IsAllyUnit(target, attacker, situation))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// ★ v0.2.56: 적이 아군 방향으로 접근 중인지 확인
+        /// 적이 아군에게 가까이 있고 근접 무기를 든 경우 = 위협
+        /// </summary>
+        private static bool IsEnemyApproachingAllies(UnitEntityData enemy, UnitEntityData attacker, Situation situation)
+        {
+            try
+            {
+                // 적이 근접 무기를 들고 있는지 확인
+                var weapon = enemy?.Body?.PrimaryHand?.MaybeWeapon;
+                bool isMeleeEnemy = weapon != null && (weapon.Blueprint?.IsMelee ?? true);
+
+                if (!isMeleeEnemy) return false;  // 원거리 적은 접근 위협이 아님
+
+                // 적이 아군 근처(15m 이내)에 있으면 접근 중으로 간주
+                if (situation?.Allies != null)
+                {
+                    foreach (var ally in situation.Allies)
+                    {
+                        if (ally == null || ally == attacker) continue;
+                        float dist = Vector3.Distance(enemy.Position, ally.Position);
+                        if (dist < 15f)  // 15m 이내 = 곧 도달
+                        {
+                            return true;
+                        }
+                    }
+                }
+                else
+                {
+                    // Situation 없으면 attacker와의 거리만 확인
+                    float distToAttacker = Vector3.Distance(enemy.Position, attacker.Position);
+                    if (distToAttacker < 15f)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// ★ v0.2.56: 유닛이 아군인지 확인 (헬퍼)
+        /// </summary>
+        private static bool IsAllyUnit(UnitEntityData unit, UnitEntityData attacker, Situation situation)
+        {
+            if (unit == null) return false;
+
+            if (situation?.Allies != null)
+            {
+                return situation.Allies.Contains(unit);
+            }
+            else
+            {
+                return unit == attacker || unit.IsAlly(attacker);
+            }
         }
 
         /// <summary>
@@ -171,111 +407,39 @@ namespace CompanionAI_Pathfinder.Analysis
             }
         }
 
-        // ★ v0.2.52: EvaluateThreatSimple() 삭제됨 - TargetAnalyzer.ThreatLevel 사용
-
-        // Support 아군 타겟 가중치
-        public static readonly AllyWeights SupportAllyWeights = new AllyWeights
+        /// <summary>
+        /// RangePreference → AIRole 변환
+        /// </summary>
+        private static AIRole ToAIRole(RangePreference pref)
         {
-            HPPercent = 1.0f,     // 매우 높음 - 낮은 HP 우선 힐
-            Distance = 0.3f,      // 낮음 - 거리 무시 (힐 사거리 김)
-            MissingHP = 0.7f      // 높음 - 손실량 많을수록 우선
-        };
+            switch (pref)
+            {
+                case RangePreference.Melee: return AIRole.Tank;
+                case RangePreference.Ranged: return AIRole.Support;
+                case RangePreference.Mixed:
+                default: return AIRole.DPS;
+            }
+        }
 
         #endregion
 
-        #region Enemy Scoring
+        #region Legacy Wrappers (호환성 유지 - 점진적 제거 예정)
 
         /// <summary>
-        /// Role 기반 적 타겟 점수 계산
-        /// ★ v0.2.52: TargetAnalyzer 통합
+        /// [DEPRECATED] ScoreEnemyUnified() 사용 권장
         /// </summary>
-        public static float ScoreEnemy(
-            UnitEntityData target,
-            Situation situation,
-            RangePreference rangePreference)
+        public static float ScoreTarget(UnitEntityData attacker, UnitEntityData target, AIRole role)
         {
-            if (target == null) return -1000f;
+            return ScoreEnemyUnified(attacker, target, role, null);
+        }
 
-            try
-            {
-                if (target.Descriptor?.State?.IsDead == true) return -1000f;
-            }
-            catch { }
-
-            var weights = GetEnemyWeights(rangePreference);
-            float score = 50f;  // 기본 점수
-
-            try
-            {
-                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
-                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
-
-                // 1. HP% 점수 (낮을수록 높음) - 마무리 타겟 우선
-                float hpPercent = analysis?.HPPercent ?? 100f;
-                float hpScore = (100f - hpPercent) * 0.5f;  // 0~50
-                score += hpScore * weights.HPPercent;
-
-                // 2. 거리 점수 (가까울수록 좋음)
-                float distance = GetDistance(situation.Unit, target);
-                float distanceScore = -distance * 2f;  // 거리 패널티
-
-                // Melee는 근접 보너스
-                if (rangePreference == RangePreference.Melee && distance <= 5f)
-                    distanceScore += 30f;
-
-                score += distanceScore * weights.Distance;
-
-                // 3. Hittable 여부
-                bool isHittable = situation.HittableEnemies?.Contains(target) ?? false;
-                if (isHittable)
-                    score += 25f * weights.Hittable;
-                else
-                    score -= 15f;
-
-                // 4. 위협도 평가 - ★ v0.2.52: TargetAnalyzer 사용
-                float threat = analysis?.ThreatLevel ?? 0.5f;
-                score += threat * 30f * weights.Threat;
-
-                // 5. v0.2.17: 킬 확정 보너스
-                if (hpPercent <= 20f)
-                    score += 25f;
-                else if (hpPercent <= 35f)
-                    score += 12f;
-
-                // 6. v0.2.17: 적 역할 보너스
-                float roleBonus = EvaluateEnemyRolePriority(target);
-                score += roleBonus;
-
-                // 7. v0.2.18: AC 기반 타겟팅 - 물리 공격자만 - ★ v0.2.52: TargetAnalyzer 사용
-                if (situation.Unit != null && IsPhysicalAttacker(situation.Unit))
-                {
-                    int targetAC = analysis?.AC ?? 20;
-                    float acScore = (30f - targetAC) * 1.0f;
-                    score += acScore * weights.ACVulnerability;
-                }
-
-                // 8. v0.2.18: 플랭킹 보너스 - ★ v0.2.52: TargetAnalyzer 사용
-                if (analysis?.IsFlanked ?? false)
-                {
-                    score += 15f;
-                    if (situation.HasSneakAttack)
-                        score += 30f;
-                }
-
-                // 9. v0.2.18: 탱크 - 아군을 교전 중인 적 우선
-                if (rangePreference == RangePreference.Melee)
-                {
-                    int alliesEngaged = CountAlliesEngagedBy(target, situation);
-                    if (alliesEngaged > 0)
-                        score += alliesEngaged * 10f;
-                }
-            }
-            catch (Exception ex)
-            {
-                Main.Verbose($"[TargetScorer] ScoreEnemy error: {ex.Message}");
-            }
-
-            return score;
+        /// <summary>
+        /// [DEPRECATED] ScoreEnemyUnified() 사용 권장
+        /// </summary>
+        public static float ScoreEnemy(UnitEntityData target, Situation situation, RangePreference rangePreference)
+        {
+            if (situation?.Unit == null) return -1000f;
+            return ScoreEnemyUnified(situation.Unit, target, ToAIRole(rangePreference), situation);
         }
 
         /// <summary>
@@ -750,8 +914,10 @@ namespace CompanionAI_Pathfinder.Analysis
             catch { return false; }
         }
 
+        // ★ v0.2.55: CountAlliesNearEnemy() 삭제됨 - CountAlliesEngaged()로 통합
+
         /// <summary>
-        /// v0.2.18: 적이 교전 중인 아군 수
+        /// v0.2.18: 적이 교전 중인 아군 수 (Debuff 스코어링용)
         /// </summary>
         private static int CountAlliesEngagedBy(UnitEntityData enemy, Situation situation)
         {
@@ -775,21 +941,11 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// v0.2.18: 스닉 어택 보유 여부
+        /// ★ v0.2.62: AbilityClassifier.HasSneakAttack() 사용 (문자열 검색 제거)
         /// </summary>
         private static bool HasSneakAttack(UnitEntityData unit)
         {
-            try
-            {
-                var features = unit?.Descriptor?.Progression?.Features?.Enumerable;
-                if (features == null) return false;
-                foreach (var f in features)
-                {
-                    if (f.Blueprint?.name?.Contains("SneakAttack") == true)
-                        return true;
-                }
-                return false;
-            }
-            catch { return false; }
+            return AbilityClassifier.HasSneakAttack(unit);
         }
 
         /// <summary>

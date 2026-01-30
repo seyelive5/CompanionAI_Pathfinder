@@ -257,19 +257,58 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                     }
                 }
 
-                // 4. ★ v0.2.52: Target selection for ally buffs (TargetAnalyzer 사용)
+                // 4. ★ v0.2.61: 버프 타입 + 타겟 역할 매칭 (스마트 타겟팅)
                 if (!isSelf && analysis != null)
                 {
-                    // Prioritize buffing allies who will benefit most
                     float targetHP = analysis.HPPercent;
 
                     // Don't buff dying allies (heal them instead)
                     if (targetHP < 30f)
                         score -= 15f;
 
-                    // Buff healthy allies who can make use of it
-                    if (targetHP > 70f)
-                        score += 5f;
+                    // ★ v0.2.61: 방어 버프 → 탱크/교전중 아군 우선
+                    if (IsDefensiveBuff(candidate))
+                    {
+                        // 탱크 역할에게 방어 버프 보너스
+                        if (analysis.EstimatedRole == TargetRole.Tank)
+                            score += 25f;
+
+                        // 교전 중인 아군에게 방어 버프 보너스
+                        if (analysis.EngagedEnemyCount > 0)
+                            score += 15f + analysis.EngagedEnemyCount * 5f;
+
+                        // HP 낮은 아군에게 방어 버프 보너스 (생존 도움)
+                        if (targetHP < 50f && targetHP > 30f)
+                            score += 10f;
+
+                        Main.Verbose($"[BuffScorer] Defensive buff {candidate.Ability?.Name} -> {target.CharacterName}: " +
+                            $"Role={analysis.EstimatedRole}, Engaged={analysis.EngagedEnemyCount}");
+                    }
+                    // ★ v0.2.61: 공격 버프 → DPS/딜러 우선
+                    else if (IsOffensiveBuff(candidate))
+                    {
+                        // 딜러 역할에게 공격 버프 보너스
+                        if (analysis.EstimatedRole == TargetRole.Melee ||
+                            analysis.EstimatedRole == TargetRole.Ranged)
+                            score += 20f;
+
+                        // 캐스터에게도 공격 버프 (스펠 데미지 증가 가능)
+                        if (analysis.EstimatedRole == TargetRole.Caster)
+                            score += 15f;
+
+                        // HP 높은 아군에게 공격 버프 (생존자가 딜을 넣어야 함)
+                        if (targetHP > 70f)
+                            score += 10f;
+
+                        Main.Verbose($"[BuffScorer] Offensive buff {candidate.Ability?.Name} -> {target.CharacterName}: " +
+                            $"Role={analysis.EstimatedRole}, HP={targetHP:F0}%");
+                    }
+                    else
+                    {
+                        // 기타 버프: HP 높은 아군 우선 (활용 가능)
+                        if (targetHP > 70f)
+                            score += 5f;
+                    }
                 }
 
                 // 5. First action bonus (buff before attack)
@@ -477,22 +516,71 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
         }
 
+        /// <summary>
+        /// ★ v0.2.61: 방어 버프인지 확인 (타입 기반 - BuffEffectAnalyzer 사용)
+        /// AC 증가, DR, 저항, 회피, 임시 HP 등
+        /// </summary>
         private bool IsDefensiveBuff(ActionCandidate candidate)
         {
-            // Check if the buff is defensive in nature
-            // This could be expanded with more detailed classification
-            if (candidate.Ability?.Name == null)
-                return false;
+            try
+            {
+                // 1. BuffEffectAnalyzer로 버프 효과 분석 (타입 기반)
+                var buffEffects = AbilityClassifier.GetBuffEffects(candidate.Ability);
+                if (buffEffects?.PrimaryBuff != null)
+                {
+                    var analysis = BuffEffectAnalyzer.Analyze(buffEffects.PrimaryBuff);
+                    if (analysis.HasDefensiveEffect)
+                        return true;
+                }
 
-            string name = candidate.Ability.Name.ToLower();
-            return name.Contains("shield") ||
-                   name.Contains("armor") ||
-                   name.Contains("protect") ||
-                   name.Contains("resist") ||
-                   name.Contains("defense") ||
-                   name.Contains("방어") ||
-                   name.Contains("보호") ||
-                   name.Contains("저항");
+                // 2. Classification의 AppliedBuff도 확인
+                var appliedBuff = candidate.Classification?.AppliedBuff;
+                if (appliedBuff != null)
+                {
+                    var analysis = BuffEffectAnalyzer.Analyze(appliedBuff);
+                    return analysis.HasDefensiveEffect;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        /// <summary>
+        /// ★ v0.2.61: 공격 버프인지 확인 (타입 기반 - BuffEffectAnalyzer 사용)
+        /// 공격 보너스, 데미지 보너스, 무기 인챈트 등
+        /// </summary>
+        private bool IsOffensiveBuff(ActionCandidate candidate)
+        {
+            try
+            {
+                // 1. BuffEffectAnalyzer로 버프 효과 분석 (타입 기반)
+                var buffEffects = AbilityClassifier.GetBuffEffects(candidate.Ability);
+                if (buffEffects != null)
+                {
+                    // 인챈트는 무조건 공격 버프
+                    if (buffEffects.IsEnchantment)
+                        return true;
+
+                    if (buffEffects.PrimaryBuff != null)
+                    {
+                        var analysis = BuffEffectAnalyzer.Analyze(buffEffects.PrimaryBuff);
+                        if (analysis.HasOffensiveEffect)
+                            return true;
+                    }
+                }
+
+                // 2. Classification의 AppliedBuff도 확인
+                var appliedBuff = candidate.Classification?.AppliedBuff;
+                if (appliedBuff != null)
+                {
+                    var analysis = BuffEffectAnalyzer.Analyze(appliedBuff);
+                    return analysis.HasOffensiveEffect;
+                }
+            }
+            catch { }
+
+            return false;
         }
 
         private bool IsBuffAlreadyApplied(AbilityData ability, UnitEntityData target)

@@ -104,14 +104,89 @@ namespace CompanionAI_Pathfinder.Planning
         }
 
         /// <summary>
-        /// 후퇴 필요 여부 확인
+        /// ★ v0.2.56: 후퇴 필요 여부 확인 (강화)
+        /// 단순 거리 체크 → 복합 위협 분석
         /// </summary>
         public static bool ShouldRetreat(Situation situation)
         {
             if (!situation.PrefersRanged)
                 return false;
 
-            return situation.NearestEnemyDistance < situation.MinSafeDistance;
+            // 동적 안전 거리 계산
+            float safeDist = GetDynamicSafeDistance(situation);
+
+            // 1. 기본: 가장 가까운 적이 안전 거리 내
+            if (situation.NearestEnemyDistance < safeDist)
+            {
+                Main.Verbose($"[MovementPlanner] ShouldRetreat: nearest enemy {situation.NearestEnemyDistance:F1}m < safe {safeDist:F1}m");
+                return true;
+            }
+
+            // 2. 복수 적이 접근 중 (10m 내에 2명 이상)
+            int nearbyEnemies = CountEnemiesWithinRange(situation, 10f);
+            if (nearbyEnemies >= 2 && situation.NearestEnemyDistance < safeDist * 1.5f)
+            {
+                Main.Verbose($"[MovementPlanner] ShouldRetreat: {nearbyEnemies} enemies nearby, nearest={situation.NearestEnemyDistance:F1}m");
+                return true;
+            }
+
+            // 3. HP 낮으면 더 빨리 후퇴 (HP 50% 미만이면 안전 거리 1.5배)
+            if (situation.HPPercent < 50f && situation.NearestEnemyDistance < safeDist * 1.5f)
+            {
+                Main.Verbose($"[MovementPlanner] ShouldRetreat: low HP ({situation.HPPercent:F0}%), nearest={situation.NearestEnemyDistance:F1}m");
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// ★ v0.2.56: 동적 안전 거리 계산
+        /// HP, 적 수, 무기 범위에 따라 조절
+        /// </summary>
+        private static float GetDynamicSafeDistance(Situation situation)
+        {
+            float baseDist = situation.MinSafeDistance;  // 기본 10f
+
+            // HP 낮으면 안전 거리 증가
+            if (situation.HPPercent < 30f)
+                baseDist *= 1.5f;
+            else if (situation.HPPercent < 50f)
+                baseDist *= 1.2f;
+
+            // 적이 많으면 안전 거리 증가
+            int nearbyEnemies = CountEnemiesWithinRange(situation, 15f);
+            if (nearbyEnemies >= 3)
+                baseDist *= 1.3f;
+
+            // 최대 20m, 최소 8m
+            return Mathf.Clamp(baseDist, 8f, 20f);
+        }
+
+        /// <summary>
+        /// ★ v0.2.56: 특정 범위 내 적 수 카운트
+        /// </summary>
+        private static int CountEnemiesWithinRange(Situation situation, float range)
+        {
+            if (situation.Enemies == null || situation.Unit == null)
+                return 0;
+
+            int count = 0;
+            Vector3 unitPos = situation.Unit.Position;
+
+            foreach (var enemy in situation.Enemies)
+            {
+                if (enemy == null) continue;
+                try
+                {
+                    if (enemy.Descriptor?.State?.IsDead == true) continue;
+                    float dist = Vector3.Distance(unitPos, enemy.Position);
+                    if (dist <= range)
+                        count++;
+                }
+                catch { }
+            }
+            return count;
         }
 
         #endregion

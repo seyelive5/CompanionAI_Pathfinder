@@ -5,8 +5,14 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Kingmaker.Blueprints;
 using Kingmaker.EntitySystem.Entities;
+using Kingmaker.EntitySystem.Stats;
+using Kingmaker.Items;
+using Kingmaker.RuleSystem;
 using Kingmaker.UnitLogic.Abilities;
+using Kingmaker.UnitLogic.Abilities.Components;
+using Kingmaker.UnitLogic.Mechanics.Actions;
 using Kingmaker.Utility;
 using UnityEngine;
 using CompanionAI_Pathfinder.Analysis;
@@ -37,8 +43,10 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             // 기존 로직 유지 (호환성 + 보너스 계산용)
             float score = candidate.BaseScore;
 
-            // 1. Target value (from existing TargetScorer integration)
-            float targetScore = ScoreTarget(candidate.Target, situation);
+            // ★ v0.2.55: 통합 타겟 스코어링 사용 (ScoreEnemyUnified)
+            // Tank의 "아군 교전" 보너스 등 모든 역할별 로직 포함
+            var role = situation.CharacterSettings?.Role ?? AIRole.DPS;
+            float targetScore = TargetScorer.ScoreEnemyUnified(situation.Unit, candidate.Target, role, situation);
             score += targetScore * 0.4f;
 
             // 2. Ability-specific scoring (for ability attacks)
@@ -64,6 +72,8 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             {
                 candidate.BonusScore += 20f;  // ★ BonusScore에 추가
             }
+
+            // ★ v0.2.55: Tank "아군 교전" 보너스는 TargetScorer.ScoreEnemyUnified()에서 처리됨
 
             // 6. Apply phase weight
             candidate.PhaseMultiplier = weights.AttackWeight;
@@ -210,52 +220,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         #endregion
 
-        #region Target Scoring
-
-        /// <summary>
-        /// Score the target based on various factors
-        /// ★ v0.2.52: TargetAnalyzer 통합
-        /// </summary>
-        private float ScoreTarget(UnitEntityData target, Situation situation)
-        {
-            if (target == null)
-                return 0f;
-
-            float score = 0f;
-
-            try
-            {
-                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
-                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
-
-                // HP-based priority (lower HP = higher priority)
-                float targetHP = analysis?.HPPercent ?? 100f;
-                score += ResponseCurves.TargetHPPriority(targetHP) * 15f;
-
-                // Threat assessment
-                float threat = analysis?.ThreatLevel ?? 0.5f;
-                score += ResponseCurves.CCTargetValue(threat) * 10f;
-
-                // Distance factor
-                float dist = Vector3.Distance(situation.Unit.Position, target.Position);
-                if (dist <= 2f)
-                    score += 5f;  // Close target bonus
-                else if (dist > 15f)
-                    score -= 5f;  // Far target penalty
-
-                // Hittable bonus
-                if (situation.HittableEnemies?.Contains(target) == true)
-                    score += 10f;
-            }
-            catch (Exception ex)
-            {
-                Main.Error($"[AttackScorer] ScoreTarget error: {ex.Message}");
-            }
-
-            return score;
-        }
-
-        #endregion
+        // ★ v0.2.55: ScoreTarget() 삭제됨 - TargetScorer.ScoreEnemyUnified() 사용
 
         #region Ability Scoring
 
@@ -371,6 +336,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
         /// <summary>
         /// Calculate bonus for potential kills
         /// ★ v0.2.52: TargetAnalyzer 통합
+        /// ★ v0.2.57: HP% 체크 - 건강한 적에게 킬보너스 적용 금지
         /// </summary>
         private float CalculateKillBonus(ActionCandidate candidate, Situation situation, PhaseRoleWeights weights)
         {
@@ -381,15 +347,47 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             {
                 // ★ v0.2.52: TargetAnalyzer 사용
                 var analysis = TargetAnalyzer.Analyze(candidate.Target, situation.Unit);
-                float targetHP = analysis?.HPPercent ?? 100f;
+                float targetHPPercent = analysis?.HPPercent ?? 100f;
                 float targetCurrentHP = candidate.Target.Stats?.HitPoints?.ModifiedValue ?? 100f;
+
+                // ★ v0.2.57: HP% 체크 - 건강한 적은 킬 대상이 아님!
+                // HP 70% 이상이면 킬 보너스 없음 (버프로 150% 등이어도 마찬가지)
+                if (targetHPPercent >= 70f)
+                {
+                    Main.Verbose($"[AttackScorer] No kill bonus for {candidate.Target?.CharacterName}: HP={targetHPPercent:F0}% >= 70%");
+                    return 0f;
+                }
+
+                // HP% 50-70%: 킬 보너스 감소 (50% 스케일)
+                float hpScaleFactor = 1f;
+                if (targetHPPercent >= 50f)
+                {
+                    hpScaleFactor = 0.5f;
+                }
+                // HP% 25-50%: 보통 킬 보너스
+                else if (targetHPPercent >= 25f)
+                {
+                    hpScaleFactor = 1f;
+                }
+                // HP% < 25%: 킬 보너스 증가 (마무리 우선)
+                else
+                {
+                    hpScaleFactor = 1.5f;
+                }
 
                 // Estimate damage (rough approximation)
                 float estimatedDamage = EstimateDamage(candidate, situation);
                 float damageRatio = targetCurrentHP > 0 ? estimatedDamage / targetCurrentHP : 0f;
 
                 float bonus = ResponseCurves.KillBonus(damageRatio);
-                return bonus * weights.KillBonusWeight;
+                float finalBonus = bonus * weights.KillBonusWeight * hpScaleFactor;
+
+                if (finalBonus > 0)
+                {
+                    Main.Verbose($"[AttackScorer] Kill bonus for {candidate.Target?.CharacterName}: HP={targetHPPercent:F0}%, dmgRatio={damageRatio:F2}, scale={hpScaleFactor}, bonus={finalBonus:F1}");
+                }
+
+                return finalBonus;
             }
             catch
             {
@@ -398,27 +396,228 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
         }
 
         /// <summary>
-        /// Rough damage estimation
+        /// Damage estimation using actual game APIs
+        /// ★ v0.2.59: 실제 무기/주문 데미지 API 사용
         /// </summary>
         private float EstimateDamage(ActionCandidate candidate, Situation situation)
         {
-            // This is a simplified estimation
-            // In a full implementation, this would analyze the ability's damage components
-
             if (candidate.ActionType == CandidateType.BasicAttack)
             {
-                // Basic attack: roughly weapon damage
-                return 10f;  // Placeholder
+                return EstimateWeaponDamage(situation.Unit);
             }
 
-            if (candidate.Classification != null)
+            var classification = candidate.Classification;
+            if (classification == null)
+                return 0f;
+
+            // 비공격 능력은 데미지 0
+            if (classification.IsSupportive)
             {
-                int level = candidate.Classification.SpellLevel;
-                // Rough: spell damage scales with level
-                return 5f + level * 8f;
+                Main.Verbose($"[AttackScorer] EstimateDamage: {candidate.Ability?.Name} is supportive, dmg=0");
+                return 0f;
             }
 
-            return 10f;
+            // 디버프/CC는 간접 데미지로 낮은 값 반환
+            if (classification.Timing == AbilityTiming.CrowdControl ||
+                classification.Timing == AbilityTiming.Debuff)
+            {
+                return 2f;
+            }
+
+            // 공격 능력: 실제 주문 데미지 추정
+            return EstimateSpellDamage(candidate.Ability, situation.Unit);
+        }
+
+        /// <summary>
+        /// ★ v0.2.59: 실제 무기 데미지 계산
+        /// </summary>
+        private float EstimateWeaponDamage(UnitEntityData unit)
+        {
+            try
+            {
+                // 1. 주무기 가져오기
+                var weapon = unit?.Body?.PrimaryHand?.MaybeWeapon;
+                if (weapon == null)
+                {
+                    weapon = unit?.GetFirstWeapon();
+                }
+
+                if (weapon == null)
+                    return 10f;  // 폴백
+
+                // 2. 무기 블루프린트에서 기본 데미지 가져오기
+                var blueprint = weapon.Blueprint;
+                if (blueprint == null)
+                    return 10f;
+
+                // 3. 주사위 공식에서 평균 데미지 계산
+                var baseDamage = blueprint.BaseDamage;
+                int rolls = baseDamage.Rolls;
+                int diceSides = (int)baseDamage.Dice;
+                float avgDice = rolls * (diceSides + 1) / 2f;
+
+                // 4. 능력치 보너스 (STR for melee, DEX for ranged with Weapon Finesse)
+                float statBonus = 0f;
+                bool isRanged = weapon.Blueprint.IsRanged;
+
+                if (isRanged)
+                {
+                    // 원거리: 일반적으로 STR 보너스 없음 (Composite Bow 제외)
+                    // 간단히 0으로 처리
+                    statBonus = 0f;
+                }
+                else
+                {
+                    // 근접: STR 보너스
+                    var strBonus = unit.Stats?.Strength?.Bonus ?? 0;
+                    statBonus = strBonus;
+
+                    // 양손 무기면 1.5배
+                    if (unit.Body?.SecondaryHand?.MaybeWeapon == null &&
+                        !weapon.Blueprint.IsLight)
+                    {
+                        statBonus *= 1.5f;
+                    }
+                }
+
+                // 5. 인챈트 보너스
+                int enhancement = weapon.EnchantmentValue;
+
+                float totalDamage = avgDice + statBonus + enhancement;
+                Main.Verbose($"[AttackScorer] WeaponDamage {unit.CharacterName}: {rolls}d{diceSides}+{statBonus:F0}+{enhancement} = {totalDamage:F1}");
+
+                return totalDamage;
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[AttackScorer] EstimateWeaponDamage error: {ex.Message}");
+                return 10f;  // 폴백
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.59: 실제 주문 데미지 계산
+        /// </summary>
+        private float EstimateSpellDamage(AbilityData ability, UnitEntityData caster)
+        {
+            try
+            {
+                if (ability?.Blueprint == null)
+                    return 0f;
+
+                // 1. 시전자 레벨 가져오기
+                int casterLevel = caster?.Progression?.CharacterLevel ?? 1;
+                if (ability.Spellbook != null)
+                {
+                    casterLevel = ability.Spellbook.CasterLevel;
+                }
+
+                // 2. 데미지 액션 찾기
+                var runActions = ability.Blueprint.GetComponents<AbilityEffectRunAction>();
+                if (runActions == null)
+                    return GetFallbackSpellDamage(ability);
+
+                float totalDamage = 0f;
+
+                foreach (var runAction in runActions)
+                {
+                    if (runAction?.Actions?.Actions == null) continue;
+
+                    foreach (var action in runAction.Actions.Actions)
+                    {
+                        if (action is ContextActionDealDamage damageAction)
+                        {
+                            totalDamage += CalculateContextDamage(damageAction, casterLevel);
+                        }
+                    }
+                }
+
+                if (totalDamage > 0f)
+                {
+                    Main.Verbose($"[AttackScorer] SpellDamage {ability.Name}: CL={casterLevel}, dmg={totalDamage:F1}");
+                    return totalDamage;
+                }
+
+                // 데미지 액션 없으면 폴백
+                return GetFallbackSpellDamage(ability);
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[AttackScorer] EstimateSpellDamage error: {ex.Message}");
+                return GetFallbackSpellDamage(ability);
+            }
+        }
+
+        /// <summary>
+        /// ContextActionDealDamage에서 평균 데미지 계산
+        /// </summary>
+        private float CalculateContextDamage(ContextActionDealDamage damageAction, int casterLevel)
+        {
+            try
+            {
+                var diceValue = damageAction.Value;
+                if (diceValue == null)
+                    return 0f;
+
+                // 주사위 타입 (D6, D8 등)
+                int diceSides = (int)diceValue.DiceType;
+                if (diceSides <= 0)
+                    return 0f;
+
+                // 주사위 개수 (고정값 또는 시전자 레벨 기반)
+                int diceCount = 1;
+                var countValue = diceValue.DiceCountValue;
+                if (countValue != null)
+                {
+                    // ValueType에 따라 다르게 처리
+                    switch (countValue.ValueType)
+                    {
+                        case Kingmaker.UnitLogic.Mechanics.ContextValueType.Rank:
+                            // 능력 랭크 = 시전자 레벨 (일반적으로)
+                            diceCount = casterLevel;
+                            break;
+                        case Kingmaker.UnitLogic.Mechanics.ContextValueType.Simple:
+                            diceCount = countValue.Value;
+                            break;
+                        default:
+                            diceCount = Math.Max(1, countValue.Value);
+                            break;
+                    }
+                }
+
+                // 보너스
+                int bonus = 0;
+                var bonusValue = diceValue.BonusValue;
+                if (bonusValue != null)
+                {
+                    bonus = bonusValue.Value;
+                }
+
+                // 평균 데미지 계산
+                float avgDice = diceCount * (diceSides + 1) / 2f;
+                float total = avgDice + bonus;
+
+                // HalfIfSaved 고려 (평균적으로 0.75배)
+                if (damageAction.HalfIfSaved)
+                {
+                    total *= 0.75f;
+                }
+
+                return total;
+            }
+            catch
+            {
+                return 0f;
+            }
+        }
+
+        /// <summary>
+        /// 폴백: 주문 레벨 기반 추정
+        /// </summary>
+        private float GetFallbackSpellDamage(AbilityData ability)
+        {
+            int spellLevel = ability?.SpellLevel ?? 1;
+            return 5f + spellLevel * 6f;  // 대략적인 추정
         }
 
         #endregion
@@ -459,6 +658,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
         #region Helper Methods
 
         // ★ v0.2.52: GetHPPercent(), AssessThreat() 삭제됨 - TargetAnalyzer 사용
+        // ★ v0.2.55: CountAlliesEngagedByEnemy() 삭제됨 - TargetScorer.ScoreEnemyUnified()에서 처리
 
         private bool IsTargetFlanked(UnitEntityData target, Situation situation)
         {
@@ -477,19 +677,42 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
         }
 
+        /// <summary>
+        /// ★ v0.2.59: 실제 게임 API로 능력 사거리 계산
+        /// </summary>
         private float GetAbilityRange(AbilityData ability)
         {
             try
             {
-                // Simplified range calculation
-                var range = ability?.Blueprint?.Range;
+                if (ability == null)
+                    return 30f;
+
+                // 실제 API 사용: GetApproachDistance는 미터 단위 반환
+                // 캐스터/타겟 체격, Reach 메타매직, 무기 사거리 등 모두 포함
+                float rangeMeters = ability.GetApproachDistance(null);
+
+                // Personal 능력은 0 반환
+                if (ability.Blueprint?.Range == Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Personal)
+                    return 0f;
+
+                // 유효한 값이면 반환
+                if (rangeMeters > 0f && !float.IsPositiveInfinity(rangeMeters))
+                    return rangeMeters;
+
+                // 폴백: 기존 로직
+                var range = ability.Blueprint?.Range;
                 if (range == Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Touch)
                     return 2f;
                 if (range == Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Weapon)
                     return 2f;
-                if (range == Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Personal)
-                    return 0f;
-                return 30f;  // Default medium range
+                if (range == Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Close)
+                    return 9.1f;  // 30 feet
+                if (range == Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Medium)
+                    return 12.2f;  // 40 feet
+                if (range == Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Long)
+                    return 15.2f;  // 50 feet
+
+                return 30f;  // Default
             }
             catch
             {
@@ -527,35 +750,11 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
         /// <summary>
         /// ★ v0.2.41: 돌격(Charge) 능력인지 확인
         /// 돌격은 최소 거리 요구가 있어서 특수 처리 필요
+        /// ★ v0.2.62: AbilityClassifier.IsChargeAbility() 사용 (문자열 검색 제거)
         /// </summary>
         private bool IsChargeAbility(AbilityData ability)
         {
-            if (ability?.Blueprint == null)
-                return false;
-
-            try
-            {
-                // 이름 기반 감지 (다국어 지원)
-                string name = ability.Name?.ToLower() ?? "";
-                string bpName = ability.Blueprint.name?.ToLower() ?? "";
-
-                // 영어: charge
-                // 한국어: 돌격
-                if (name.Contains("charge") || name.Contains("돌격") ||
-                    bpName.Contains("charge"))
-                {
-                    return true;
-                }
-
-                // AbilityType이 CombatManeuver이고 Full Round인 경우도 Charge일 가능성
-                // (추가 검증 필요 시 구현)
-
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
+            return AbilityClassifier.IsChargeAbility(ability);
         }
 
         #endregion

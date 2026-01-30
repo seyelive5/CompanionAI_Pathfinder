@@ -161,12 +161,12 @@ namespace CompanionAI_Pathfinder.Analysis
             situation.HasSwiftAction = turnState?.HasSwiftAction ?? true;
 
             // v0.2.18: 스닉 어택 보유 감지
+            // ★ v0.2.62: AbilityClassifier.HasSneakAttack() 사용 (문자열 검색 제거)
             try
             {
-                situation.HasSneakAttack = unit.Descriptor?.Progression?.Features?.Enumerable?
-                    .Any(f => f.Blueprint?.name?.Contains("SneakAttack") == true) ?? false;
+                situation.HasSneakAttack = AbilityClassifier.HasSneakAttack(unit);
                 if (situation.HasSneakAttack)
-                    Main.Verbose($"[Analyzer] {unit.CharacterName} has Sneak Attack");
+                    Main.Verbose($"[Analyzer] {unit.CharacterName} has Sneak Attack (dice={unit.Stats.SneakAttack.BaseValue})");
             }
             catch { }
 
@@ -348,7 +348,8 @@ namespace CompanionAI_Pathfinder.Analysis
             {
                 if (enemy == null || enemy.Descriptor.State.IsDead) continue;
 
-                float distanceToEnemy = Vector3.Distance(unit.Position, enemy.Position);
+                // ★ v0.2.61: 게임의 2D 거리 계산 사용 (Y축 무시) - 탑승 캐릭터 수정
+                float distanceToEnemy = unit.DistanceTo(enemy);
                 bool canHit = false;
                 string hitReason = "";
 
@@ -366,17 +367,25 @@ namespace CompanionAI_Pathfinder.Analysis
                     }
                     else
                     {
-                        // 디버깅: 왜 타겟 불가인지 상세 로깅
-                        Main.Verbose($"[Analyzer] {enemy.CharacterName}: {attack.Name} CanTarget=false (dist={distanceToEnemy:F1}m)");
+                        // ★ v0.2.61: 상세 원인 로깅 추가
+                        string reason = "";
+                        try { reason = attack.CantTargetReason(targetWrapper); } catch { }
+                        Main.Verbose($"[Analyzer] {enemy.CharacterName}: {attack.Name} CanTarget=false (dist={distanceToEnemy:F1}m, reason={reason})");
                     }
                 }
 
                 // v0.2.7: 공격 능력 없으면 기본 공격으로 체크 (UnitAttack)
-                if (!canHit && distanceToEnemy <= GetMeleeReach(unit))
+                // ★ v0.2.61: 탑승 캐릭터의 경우 Charge 등이 실패해도 기본 공격 가능
+                float meleeReach = GetMeleeReach(unit);
+                if (!canHit && distanceToEnemy <= meleeReach)
                 {
                     // 근접 범위 내면 기본 공격 가능으로 간주
                     canHit = true;
                     hitReason = "Melee reach";
+                }
+                else if (!canHit)
+                {
+                    Main.Verbose($"[Analyzer] {enemy.CharacterName}: melee fallback failed (dist={distanceToEnemy:F1}m > reach={meleeReach:F1}m)");
                 }
 
                 // ★ v0.2.50: LOS (Line of Sight) 체크 추가
@@ -429,39 +438,47 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>
         /// v0.2.7: 유닛의 근접 도달 범위 계산
         /// Pathfinder에서 기본 reach는 5피트 (약 1.5m), Reach 무기는 10피트
+        /// ★ v0.2.61: 게임 API 사용 (탑승, 크기, Reach 보너스 포함)
         /// </summary>
         private float GetMeleeReach(UnitEntityData unit)
         {
             try
             {
+                // ★ v0.2.61: 게임 API의 GetWeaponRange 사용 - 탑승, 크기, Reach 스탯 모두 포함
                 var weapon = unit?.Body?.PrimaryHand?.MaybeWeapon;
                 if (weapon != null)
                 {
-                    // v0.2.7: 실제 무기 사거리 사용
+                    // AttackRange는 내부적으로 wielder.GetWeaponRange()를 호출
+                    // 이는 무기 기본 사거리 + Stats.ReachRange (크기/Reach 보너스)를 포함
                     var attackRange = weapon.AttackRange;
                     if (attackRange.Meters > 0)
                     {
-                        return attackRange.Meters + 0.5f; // 약간의 여유
+                        // Corpulence (몸 크기) 보너스 추가
+                        float corpulenceBonus = unit.Corpulence;
+                        float reach = attackRange.Meters + corpulenceBonus + 0.5f; // 약간의 여유
+                        Main.Verbose($"[Analyzer] GetMeleeReach: {unit.CharacterName} = {reach:F1}m (wpn={attackRange.Meters:F1}m, corp={corpulenceBonus:F1}m)");
+                        return reach;
                     }
-
-                    // 폴백: Reach 속성 확인
-                    var weaponType = weapon.Blueprint?.Type;
-                    if (weaponType != null)
-                    {
-                        var typeRange = weaponType.AttackRange;
-                        if (typeRange.Meters > 2f)
-                        {
-                            return 3.5f;  // Reach=10ft(3m)
-                        }
-                    }
-                    return 2.0f;  // Normal=5ft(1.5m) + 여유
                 }
-                return 2.0f;  // 기본값
+
+                // 폴백: Descriptor에서 직접 Reach 계산
+                if (unit?.Descriptor != null)
+                {
+                    var reachRange = unit.Descriptor.GetWeaponRange(null);
+                    if (reachRange.Meters > 0)
+                    {
+                        float reach = reachRange.Meters + unit.Corpulence + 0.5f;
+                        Main.Verbose($"[Analyzer] GetMeleeReach (fallback): {unit.CharacterName} = {reach:F1}m");
+                        return reach;
+                    }
+                }
+
+                return 2.5f;  // 기본값 (5ft + 여유)
             }
             catch (Exception ex)
             {
                 Main.Verbose($"[Analyzer] GetMeleeReach error: {ex.Message}");
-                return 2.0f;
+                return 2.5f;
             }
         }
 

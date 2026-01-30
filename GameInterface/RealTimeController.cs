@@ -169,8 +169,10 @@ namespace CompanionAI_Pathfinder.GameInterface
             // 대신 치명적인 상태만 체크하고, 애니메이션 상태는 Commands.Empty 체크로 커버
             // ★ v0.2.52: 탑승된 마운트 체크를 최상단으로 이동 (stuck command 오탐 방지)
             // 마운트는 라이더가 제어하므로 자체 명령이 시작되지 않음 → "stuck" 오탐 발생
+            // ★ v0.2.60: _lastDecisionTime 업데이트하여 매 프레임 호출 방지 (스터터링 수정)
             if (IsMountBeingRidden(unit))
             {
+                _lastDecisionTime[unitId] = currentTime;
                 return;
             }
 
@@ -178,69 +180,17 @@ namespace CompanionAI_Pathfinder.GameInterface
             if (state == null)
             {
                 Main.Verbose($"[RT] {unitName}: Cannot act - State=null");
+                _lastDecisionTime[unitId] = currentTime;  // ★ v0.2.54: Throttle even on early return
                 return;
             }
 
-            // 치명적 상태만 체크 (애니메이션 상태는 Commands.Empty로 처리)
-            if (state.IsDead)
+            // ★ v0.2.54: 행동 불가 상태 체크를 하나의 블록으로 통합
+            // 불가 상태에서도 _lastDecisionTime을 업데이트하여 매 프레임 체크 방지
+            string cannotActReason = GetCannotActReason(state);
+            if (cannotActReason != null)
             {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Dead");
-                return;
-            }
-            if (!state.IsConscious)
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - NotConscious");
-                return;
-            }
-            if (state.IsUnconscious)
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Unconscious");
-                return;
-            }
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Paralyzed))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Paralyzed");
-                return;
-            }
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Petrified))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Petrified");
-                return;
-            }
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Stunned))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Stunned");
-                return;
-            }
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.CantAct))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - CantAct condition");
-                return;
-            }
-            // ★ v0.2.45: 추가 CC 조건 체크
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Dazed))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Dazed");
-                return;
-            }
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Nauseated))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Nauseated");
-                return;
-            }
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Cowering))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Cowering (fear)");
-                return;
-            }
-            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Frightened))
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Frightened");
-                return;
-            }
-            if (state.Prone?.Active == true)
-            {
-                Main.Verbose($"[RT] {unitName}: Cannot act - Prone (knockdown)");
+                Main.Verbose($"[RT] {unitName}: Cannot act - {cannotActReason}");
+                _lastDecisionTime[unitId] = currentTime;  // Throttle even when can't act
                 return;
             }
             // ★ v0.2.43: IsInExclusiveState는 체크하지 않음 - Commands.Empty 체크가 커버함
@@ -429,6 +379,27 @@ namespace CompanionAI_Pathfinder.GameInterface
         }
 
         #endregion
+
+        /// <summary>
+        /// ★ v0.2.54: 행동 불가 상태 체크 (통합)
+        /// </summary>
+        /// <returns>불가 사유 문자열, 행동 가능시 null</returns>
+        private string GetCannotActReason(Kingmaker.UnitLogic.UnitState state)
+        {
+            if (state.IsDead) return "Dead";
+            if (!state.IsConscious) return "NotConscious";
+            if (state.IsUnconscious) return "Unconscious";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Paralyzed)) return "Paralyzed";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Petrified)) return "Petrified";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Stunned)) return "Stunned";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.CantAct)) return "CantAct";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Dazed)) return "Dazed";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Nauseated)) return "Nauseated";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Cowering)) return "Cowering";
+            if (state.HasCondition(Kingmaker.UnitLogic.UnitCondition.Frightened)) return "Frightened";
+            if (state.Prone?.Active == true) return "Prone";
+            return null;  // Can act
+        }
 
         #region AI Decision
 
@@ -839,13 +810,14 @@ namespace CompanionAI_Pathfinder.GameInterface
         /// <summary>
         /// Select best target using TargetScorer
         /// v0.2.7: Relaxed combat state check for better enemy detection
+        /// ★ v0.2.58: ScoreEnemyUnified 사용 (통합 스코어링)
         /// </summary>
         private UnitEntityData SelectBestTarget(Situation situation, AIRole role)
         {
             if (situation.Enemies == null || situation.Enemies.Count == 0)
                 return null;
 
-            // Use TargetScorer for intelligent selection
+            // ★ v0.2.58: 통합 스코어링 사용 (Situation 전달로 아군 위협 감지 등 활성화)
             float bestScore = float.MinValue;
             UnitEntityData bestTarget = null;
 
@@ -853,14 +825,12 @@ namespace CompanionAI_Pathfinder.GameInterface
             {
                 if (enemy == null) continue;
                 if (enemy.HPLeft <= 0) continue;
-                // v0.2.7: IsInCombat 체크 제거 - 적군 목록에 있으면 타겟 가능
-                // 전투 상태가 아직 설정되지 않은 적도 타겟 가능하도록
 
                 float dist = Vector3.Distance(situation.Unit.Position, enemy.Position);
                 if (dist > MAX_ENGAGEMENT_DISTANCE) continue;
 
-                // Static method call
-                float score = TargetScorer.ScoreTarget(situation.Unit, enemy, role);
+                // ★ v0.2.58: ScoreEnemyUnified 사용 (situation 포함)
+                float score = TargetScorer.ScoreEnemyUnified(situation.Unit, enemy, role, situation);
 
                 if (score > bestScore)
                 {
@@ -873,6 +843,7 @@ namespace CompanionAI_Pathfinder.GameInterface
             if (bestTarget != null)
             {
                 situation.BestTarget = bestTarget;
+                Main.Verbose($"[RT] SelectBestTarget: {bestTarget.CharacterName} (score={bestScore:F1})");
             }
 
             return bestTarget;

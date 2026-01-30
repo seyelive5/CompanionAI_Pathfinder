@@ -1,4 +1,5 @@
 // ★ v0.2.22: Unified Decision Engine - Combat Phase Detector
+// ★ v0.2.59: 실시간 전투 라운드 추정 구현
 using System;
 using System.Linq;
 using Kingmaker;
@@ -30,6 +31,11 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
         // Opening thresholds
         private const int OPENING_MAX_ROUND = 2;
         private const float OPENING_MIN_HP = 80f;
+
+        // ★ v0.2.59: 실시간 전투 라운드 추정
+        private const float SECONDS_PER_ROUND = 6f;  // D&D: 1 라운드 = 6초
+        private static float _realtimeCombatStartTime = 0f;
+        private static bool _wasInCombat = false;
 
         #endregion
 
@@ -162,25 +168,58 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
 
         /// <summary>
         /// Get current combat round (1-based)
+        /// ★ v0.2.59: 실시간 전투 라운드 추정 구현
         /// </summary>
         private int GetCombatRound()
         {
             try
             {
+                // 턴제 모드
                 if (CombatController.IsInTurnBasedCombat())
                 {
                     var tbController = Game.Instance.TurnBasedCombatController;
                     return tbController?.RoundNumber ?? 1;
                 }
 
-                // Real-time: estimate based on combat duration
-                // This is approximate - could use combat start time tracking
-                return 1;  // Default to opening for real-time
+                // 실시간 모드: 전투 시간 기반 라운드 추정
+                bool isInCombat = Game.Instance?.Player?.IsInCombat ?? false;
+
+                if (isInCombat && !_wasInCombat)
+                {
+                    // 전투 시작 감지
+                    _realtimeCombatStartTime = UnityEngine.Time.time;
+                    _wasInCombat = true;
+                    Main.Verbose($"[PhaseDetector] Real-time combat started at {_realtimeCombatStartTime:F1}s");
+                }
+                else if (!isInCombat && _wasInCombat)
+                {
+                    // 전투 종료 감지
+                    _wasInCombat = false;
+                    _realtimeCombatStartTime = 0f;
+                }
+
+                if (!isInCombat || _realtimeCombatStartTime <= 0f)
+                    return 1;
+
+                // 경과 시간으로 라운드 계산 (6초 = 1라운드)
+                float elapsed = UnityEngine.Time.time - _realtimeCombatStartTime;
+                int round = Math.Max(1, (int)(elapsed / SECONDS_PER_ROUND) + 1);
+
+                return round;
             }
             catch
             {
                 return 1;
             }
+        }
+
+        /// <summary>
+        /// ★ v0.2.59: 전투 종료 시 상태 초기화 (외부 호출용)
+        /// </summary>
+        public static void ResetCombatTracking()
+        {
+            _realtimeCombatStartTime = 0f;
+            _wasInCombat = false;
         }
 
         /// <summary>

@@ -1,10 +1,14 @@
+using System;
+using Kingmaker.Blueprints;
 using Kingmaker.UnitLogic.Abilities;
 using Kingmaker.UnitLogic.Abilities.Blueprints;
+using Kingmaker.UnitLogic.Abilities.Components;
 
 namespace CompanionAI_Pathfinder.Abstraction
 {
     /// <summary>
     /// Pathfinder의 AbilityData를 IAbilityData 인터페이스로 래핑
+    /// ★ v0.2.59: RemainingCharges 실제 구현
     /// </summary>
     public class PathfinderAbilityAdapter : IAbilityData
     {
@@ -40,7 +44,32 @@ namespace CompanionAI_Pathfinder.Abstraction
 
         // === 리소스 ===
         public bool HasCharges => _ability?.ResourceCost > 0 || SpellLevel > 0;
-        public int RemainingCharges => 0; // TODO: 실제 구현 필요
+        /// <summary>
+        /// ★ v0.2.59: 실제 능력 리소스 잔여 횟수 반환
+        /// </summary>
+        public int RemainingCharges
+        {
+            get
+            {
+                try
+                {
+                    if (_ability?.Caster == null || _blueprint == null)
+                        return -1;  // 무제한
+
+                    // AbilityResourceLogic 컴포넌트에서 리소스 정보 가져오기
+                    var resourceLogic = _blueprint.GetComponent<AbilityResourceLogic>();
+                    if (resourceLogic?.RequiredResource == null)
+                        return -1;  // 리소스 제한 없음
+
+                    // 캐스터의 리소스 컬렉션에서 잔여 횟수 가져오기
+                    return _ability.Caster.Resources.GetResourceAmount(resourceLogic.RequiredResource);
+                }
+                catch
+                {
+                    return -1;  // 오류 시 무제한으로 처리
+                }
+            }
+        }
         public int SpellLevel => _ability?.SpellLevel ?? 0;
 
         // === 원본 객체 접근 ===

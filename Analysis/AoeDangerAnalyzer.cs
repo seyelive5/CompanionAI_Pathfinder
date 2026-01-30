@@ -1,4 +1,5 @@
 // ★ v0.2.49: AoE 위험 지역 분석기
+// ★ v0.2.59: NavMesh 검증 추가
 // 유닛이 적대적 지역 효과(Grease, Entangle, 화염 지역 등) 안에 있는지 감지
 // 이탈 필요 여부 및 안전한 방향 계산
 using System;
@@ -8,6 +9,7 @@ using Kingmaker;
 using Kingmaker.Blueprints.Classes.Spells;
 using Kingmaker.EntitySystem.Entities;
 using Kingmaker.UnitLogic.Abilities.Blueprints;
+using Kingmaker.View;
 using UnityEngine;
 
 namespace CompanionAI_Pathfinder.Analysis
@@ -360,6 +362,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 안전한 탈출 위치 계산
+        /// ★ v0.2.59: NavMesh 검증 추가
         /// </summary>
         private static Vector3? CalculateEscapePosition(UnitEntityData unit, List<DangerousEffect> dangers)
         {
@@ -379,11 +382,12 @@ namespace CompanionAI_Pathfinder.Analysis
                     Vector3 direction = Quaternion.Euler(0, angle, 0) * Vector3.forward;
                     Vector3 testPosition = unitPos + direction * ESCAPE_DISTANCE;
 
+                    // ★ v0.2.59: NavMesh 위치 검증
+                    if (!IsPositionValid(unitPos, testPosition))
+                        continue;  // 이동 불가능한 위치 스킵
+
                     // 이 위치의 안전도 계산
                     float safetyScore = CalculatePositionSafety(testPosition, dangers);
-
-                    // 이동 가능한지 확인 (간단한 체크)
-                    // TODO: NavMesh 체크 추가 가능
 
                     if (safetyScore > bestScore)
                     {
@@ -406,6 +410,42 @@ namespace CompanionAI_Pathfinder.Analysis
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// ★ v0.2.59: 위치가 유효하고 도달 가능한지 확인
+        /// </summary>
+        private static bool IsPositionValid(Vector3 from, Vector3 to)
+        {
+            try
+            {
+                // 1. 목표 위치가 NavMesh 위에 있는지 확인
+                if (!ObstacleAnalyzer.IsPointInsideNavMesh(to))
+                {
+                    // NavMesh 밖이면 가장 가까운 유효 위치로 스냅
+                    var nearest = ObstacleAnalyzer.GetNearestNode(to, null);
+                    if (nearest.node == null)
+                        return false;
+
+                    // 스냅된 위치가 원래 위치에서 너무 멀면 무효
+                    if (Vector3.Distance(to, nearest.position) > 2f)
+                        return false;
+                }
+
+                // 2. 경로가 막혀있는지 확인
+                Vector3 blocked = ObstacleAnalyzer.TraceAlongNavmesh(from, to);
+                float pathBlocked = Vector3.Distance(blocked, to);
+
+                // 목표 지점과 막힌 지점 차이가 1m 이상이면 경로 막힘
+                if (pathBlocked > 1f)
+                    return false;
+
+                return true;
+            }
+            catch
+            {
+                return true;  // 오류 시 기존 동작 유지
+            }
         }
 
         /// <summary>

@@ -7,12 +7,16 @@ using Kingmaker.Designers.EventConditionActionSystem.Actions;
 using Kingmaker.ElementsSystem;
 using Kingmaker.EntitySystem.Entities;
 using Kingmaker.EntitySystem.Stats;
+using Kingmaker.Enums.Damage;
+using Kingmaker.UnitLogic;
 using Kingmaker.UnitLogic.Abilities;
 using Kingmaker.UnitLogic.Abilities.Blueprints;
 using Kingmaker.UnitLogic.Abilities.Components;
 using Kingmaker.UnitLogic.Abilities.Components.Base;
 using Kingmaker.UnitLogic.Buffs.Blueprints;
+using Kingmaker.UnitLogic.FactLogic;
 using Kingmaker.UnitLogic.Mechanics.Actions;
+using Kingmaker.UnitLogic.Parts;
 using Kingmaker.Utility;
 
 namespace CompanionAI_Pathfinder.Analysis
@@ -214,10 +218,16 @@ namespace CompanionAI_Pathfinder.Analysis
         // === Mind-Affecting (정신 면역 체크) ===
         MindAffecting = 512,  // SpellDescriptor.MindAffecting
 
+        // === v0.2.59: Additional CC types for immunity checks ===
+        Blind = 1024,         // UnitCondition.Blindness
+        Slow = 2048,          // UnitCondition.Slowed
+        Entangle = 4096,      // UnitCondition.Entangled
+        Nauseate = 8192,      // UnitCondition.Nauseated
+
         // === 그룹 ===
         HardCC = Stun | Paralysis | Petrified | Sleep,
         SoftCC = Confusion | Charm | Fear | Daze,
-        AllCC = HardCC | SoftCC | MovementImpair,
+        AllCC = HardCC | SoftCC | MovementImpair | Blind | Slow | Entangle | Nauseate,
     }
 
     /// <summary>
@@ -1037,42 +1047,54 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// v0.2.1: 사기저하(Demoralize) 능력인지 감지
-        /// 이름 기반 + Blueprint 분석
+        /// ★ v0.2.62: SpellDescriptor 기반으로 변경 (문자열 검색 제거)
         /// </summary>
         private static bool IsDemoralize(AbilityData ability)
         {
             if (ability?.Blueprint == null) return false;
 
-            // 이름 기반 감지 (다국어 지원)
-            string name = ability.Name?.ToLower() ?? "";
-            string bpName = ability.Blueprint.name?.ToLower() ?? "";
-
-            // 영어: demoralize, intimidate, fearsome
-            // 한국어: 사기저하, 위협
-            if (name.Contains("demoralize") || name.Contains("사기") ||
-                name.Contains("intimidate") || name.Contains("위협") ||
-                bpName.Contains("demoralize") || bpName.Contains("intimidate") ||
-                bpName.Contains("fearsome"))
-            {
-                return true;
-            }
-
-            // Blueprint 컴포넌트 기반 감지
-            // Demoralize는 보통 Shaken 버프를 적용하고 Intimidate 체크를 함
             try
             {
+                // 1. SpellDescriptor로 Fear/Shaken 감지
+                var descriptor = ability.Blueprint.SpellDescriptor;
+                bool hasFearDescriptor = (descriptor & (SpellDescriptor.Fear | SpellDescriptor.Shaken)) != 0;
+                if (hasFearDescriptor)
+                {
+                    // Demoralize는 보통 Shaken만 적용 (Fear 아님)
+                    // 그리고 타겟이 적이어야 함
+                    if (ability.Blueprint.CanTargetEnemies)
+                        return true;
+                }
+
+                // 2. ContextActionApplyBuff로 Shaken 적용하는지 체크
                 var runAction = ability.Blueprint.GetComponent<AbilityEffectRunAction>();
                 if (runAction?.Actions?.Actions != null)
                 {
                     foreach (var action in runAction.Actions.Actions)
                     {
-                        // Demoralize 액션 타입 체크 (있다면)
-                        if (action?.GetType().Name.Contains("Demoralize") == true)
+                        if (action is ContextActionApplyBuff applyBuff && applyBuff.Buff != null)
+                        {
+                            // Shaken 버프 적용하는지 체크
+                            var buffDesc = applyBuff.Buff.SpellDescriptor;
+                            if ((buffDesc & SpellDescriptor.Shaken) != 0)
+                                return true;
+
+                            // 버프가 Shaken 조건을 추가하는지 체크
+                            var addCondition = applyBuff.Buff.GetComponent<AddCondition>();
+                            if (addCondition?.Condition == UnitCondition.Shaken)
+                                return true;
+                        }
+
+                        // Demoralize 타입 액션 체크
+                        if (action is Demoralize)
                             return true;
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Main.Error($"[AbilityClassifier] IsDemoralize error for {ability?.Name}: {ex.Message}");
+            }
 
             return false;
         }
@@ -1415,30 +1437,174 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 특정 원소에 저항/면역이 있는지 확인
-        /// TODO: 유닛의 저항/면역 정보 조회 구현 필요
+        /// ★ v0.2.59: UnitPartDamageReduction API 사용
         /// </summary>
         public static bool HasElementResistance(UnitEntityData target, DamageElement element)
         {
-            // TODO: 실제 저항/면역 체크 구현
-            // target.Descriptor.Stats.DamageResistance 등 확인 필요
-            return false;
+            if (target == null)
+                return false;
+
+            try
+            {
+                var drPart = target.Get<UnitPartDamageReduction>();
+                if (drPart == null)
+                    return false;
+
+                // DamageElement → DamageEnergyType 매핑
+                DamageEnergyType? energyType = ElementToEnergyType(element);
+                if (!energyType.HasValue)
+                    return false;
+
+                // 면역 체크
+                if (drPart.IsImmune(energyType.Value))
+                {
+                    Main.Verbose($"[AbilityClassifier] {target.CharacterName} is immune to {element}");
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[AbilityClassifier] HasElementResistance error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// DamageElement → DamageEnergyType 변환
+        /// </summary>
+        private static DamageEnergyType? ElementToEnergyType(DamageElement element)
+        {
+            switch (element)
+            {
+                case DamageElement.Fire: return DamageEnergyType.Fire;
+                case DamageElement.Cold: return DamageEnergyType.Cold;
+                case DamageElement.Electricity: return DamageEnergyType.Electricity;
+                case DamageElement.Acid: return DamageEnergyType.Acid;
+                case DamageElement.Sonic: return DamageEnergyType.Sonic;
+                default: return null;
+            }
         }
 
         /// <summary>
         /// 특정 CC에 면역이 있는지 확인
-        /// TODO: 유닛의 CC 면역 정보 조회 구현 필요
+        /// ★ v0.2.59: UnitState.HasConditionImmunity API 사용
         /// </summary>
         public static bool HasCCImmunity(UnitEntityData target, CCType ccType)
         {
-            // TODO: 실제 면역 체크 구현
-            // 예: 언데드는 MindAffecting 면역
-            // 예: 엘프는 Sleep 면역
-            return false;
+            if (target == null)
+                return false;
+
+            try
+            {
+                var state = target.Descriptor?.State;
+                if (state == null)
+                    return false;
+
+                // CCType → UnitCondition 매핑하여 면역 체크
+                switch (ccType)
+                {
+                    case CCType.Stun:
+                        return state.HasConditionImmunity(UnitCondition.Stunned);
+
+                    case CCType.Fear:
+                        return state.HasConditionImmunity(UnitCondition.Frightened) ||
+                               state.HasConditionImmunity(UnitCondition.Shaken) ||
+                               state.HasConditionImmunity(UnitCondition.Cowering);
+
+                    case CCType.Paralysis:
+                        return state.HasConditionImmunity(UnitCondition.Paralyzed);
+
+                    case CCType.Sleep:
+                        return state.HasConditionImmunity(UnitCondition.Sleeping);
+
+                    case CCType.Blind:
+                        return state.HasConditionImmunity(UnitCondition.Blindness);
+
+                    case CCType.Confusion:
+                        return state.HasConditionImmunity(UnitCondition.Confusion);
+
+                    case CCType.Slow:
+                        return state.HasConditionImmunity(UnitCondition.Slowed);
+
+                    case CCType.Entangle:
+                        return state.HasConditionImmunity(UnitCondition.Entangled);
+
+                    case CCType.Nauseate:
+                        return state.HasConditionImmunity(UnitCondition.Nauseated);
+
+                    default:
+                        return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[AbilityClassifier] HasCCImmunity error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.59: 언데드/구조물 여부 확인
+        /// </summary>
+        public static bool IsUndeadOrConstruct(UnitEntityData target)
+        {
+            if (target == null)
+                return false;
+
+            try
+            {
+                // 언데드 체크
+                var state = target.Descriptor?.State;
+                if (state != null)
+                {
+                    // 언데드는 일반적으로 정신 영향 면역
+                    if (state.HasConditionImmunity(UnitCondition.Sleeping) &&
+                        state.HasConditionImmunity(UnitCondition.Stunned))
+                    {
+                        // 추가 확인: 크리처 타입 (가능한 경우)
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.59: 죽음 면역 여부 확인
+        /// </summary>
+        public static bool HasDeathImmunity(UnitEntityData target)
+        {
+            if (target == null)
+                return false;
+
+            try
+            {
+                // 죽음 면역은 특정 버프나 특성으로 확인
+                // UnitPartSpellResistance로 Death descriptor 면역 체크
+                var srPart = target.Get<UnitPartSpellResistance>();
+                if (srPart == null)
+                    return false;
+
+                // 일부 크리처는 죽음 효과 면역 (언데드, 구조물 등)
+                return IsUndeadOrConstruct(target);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         /// <summary>
         /// 특정 타겟에게 능력이 효과적인지 평가 (0.0 ~ 1.0)
         /// 높을수록 효과적
+        /// ★ v0.2.59: 실제 면역/저항 API 사용
         /// </summary>
         public static float EvaluateEffectiveness(AbilityClassification ability, UnitEntityData target)
         {
@@ -1447,32 +1613,47 @@ namespace CompanionAI_Pathfinder.Analysis
 
             float score = 1.0f;
 
-            // 원소 저항 체크
+            // ★ v0.2.59: Use Ability?.Blueprint?.Name for logging
+            string abilityName = ability.Ability?.Blueprint?.Name ?? "Unknown";
+
+            // 원소 저항/면역 체크
             if (ability.DamageElement != DamageElement.None)
             {
                 if (HasElementResistance(target, ability.DamageElement))
-                    score *= 0.3f; // 저항 있으면 효율 30%
+                {
+                    Main.Verbose($"[AbilityClassifier] {abilityName}: {target.CharacterName} has {ability.DamageElement} immunity");
+                    return 0f;  // 면역이면 0
+                }
             }
 
             // CC 면역 체크
             if (ability.CCType != CCType.None)
             {
                 if (HasCCImmunity(target, ability.CCType))
-                    return 0f; // CC 면역이면 사용 불가
+                {
+                    Main.Verbose($"[AbilityClassifier] {abilityName}: {target.CharacterName} has {ability.CCType} immunity");
+                    return 0f;  // CC 면역이면 사용 불가
+                }
 
                 // 정신 영향 + 언데드/구조물 체크
                 if (ability.IsMindAffecting)
                 {
-                    // TODO: 타겟이 언데드/구조물인지 체크
-                    // if (IsUndeadOrConstruct(target)) return 0f;
+                    if (IsUndeadOrConstruct(target))
+                    {
+                        Main.Verbose($"[AbilityClassifier] {abilityName}: {target.CharacterName} is undead/construct (mind-affecting immune)");
+                        return 0f;
+                    }
                 }
             }
 
             // 죽음 효과 면역 체크
             if (ability.IsDeathEffect)
             {
-                // TODO: 죽음 면역 체크
-                // if (HasDeathImmunity(target)) return 0f;
+                if (HasDeathImmunity(target))
+                {
+                    Main.Verbose($"[AbilityClassifier] {abilityName}: {target.CharacterName} has death immunity");
+                    return 0f;
+                }
             }
 
             return score;
@@ -1584,6 +1765,215 @@ namespace CompanionAI_Pathfinder.Analysis
                 return buffs.First();
 
             return null;
+        }
+
+        #endregion
+
+        #region v0.2.62 String-free Detection APIs
+
+        /// <summary>
+        /// ★ v0.2.62: 스닉 어택 보유 여부 (게임 API 사용, 문자열 검색 제거)
+        /// </summary>
+        public static bool HasSneakAttack(UnitEntityData unit)
+        {
+            if (unit?.Stats?.SneakAttack == null)
+                return false;
+
+            return unit.Stats.SneakAttack.BaseValue > 0;
+        }
+
+        /// <summary>
+        /// ★ v0.2.62: Charge 능력 여부 (컴포넌트 타입 체크, 문자열 검색 제거)
+        /// </summary>
+        public static bool IsChargeAbility(AbilityData ability)
+        {
+            if (ability?.Blueprint == null)
+                return false;
+
+            return ability.Blueprint.GetComponent<AbilityCustomCharge>() != null;
+        }
+
+        /// <summary>
+        /// ★ v0.2.62: CC 해제 능력 정보
+        /// </summary>
+        public class CCRemovalInfo
+        {
+            public bool RemovesFear { get; set; }        // SpellDescriptor.Fear 해제
+            public bool RemovesParalysis { get; set; }   // SpellDescriptor.Paralysis 해제
+            public bool RemovesMovement { get; set; }    // MovementImpairing 해제
+            public bool RemovesDisease { get; set; }     // SpellDescriptor.Disease 해제
+            public bool RemovesCurse { get; set; }       // SpellDescriptor.Curse 해제
+            public bool RemovesPoison { get; set; }      // SpellDescriptor.Poison 해제
+            public bool RemovesAny { get; set; }         // DispelMagic, BreakEnchantment
+            public bool IsRestoration { get; set; }      // Restoration 계열
+            public bool IsHeal { get; set; }             // Heal 계열 (모든 상태이상 해제)
+
+            /// <summary>특정 조건 해제 가능 여부</summary>
+            public bool CanRemove(UnitCondition condition)
+            {
+                if (RemovesAny || IsHeal) return true;
+
+                switch (condition)
+                {
+                    case UnitCondition.Frightened:
+                    case UnitCondition.Shaken:
+                        return RemovesFear;
+
+                    case UnitCondition.Paralyzed:
+                        return RemovesParalysis;
+
+                    case UnitCondition.Entangled:
+                    case UnitCondition.CantMove:
+                    case UnitCondition.MovementBan:
+                        return RemovesMovement;
+
+                    case UnitCondition.Nauseated:
+                    case UnitCondition.Sickened:
+                        return RemovesDisease || IsRestoration;
+
+                    case UnitCondition.Confusion:
+                        return RemovesAny;
+
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.62: CC 해제 능력 캐시 (GUID 기반)
+        /// </summary>
+        private static readonly Dictionary<string, CCRemovalInfo> _ccRemovalCache
+            = new Dictionary<string, CCRemovalInfo>();
+
+        /// <summary>
+        /// ★ v0.2.62: CC 해제 능력 정보 가져오기 (캐싱)
+        /// </summary>
+        public static CCRemovalInfo GetCCRemovalInfo(BlueprintAbility blueprint)
+        {
+            if (blueprint == null) return null;
+
+            string key = blueprint.AssetGuid.ToString();
+            if (_ccRemovalCache.TryGetValue(key, out var cached))
+                return cached;
+
+            var info = AnalyzeCCRemoval(blueprint);
+            _ccRemovalCache[key] = info;
+            return info;
+        }
+
+        /// <summary>
+        /// ★ v0.2.62: CC 해제 능력 분석 (SpellDescriptor 기반)
+        /// </summary>
+        private static CCRemovalInfo AnalyzeCCRemoval(BlueprintAbility blueprint)
+        {
+            var info = new CCRemovalInfo();
+
+            try
+            {
+                // 1. SpellDescriptor 분석
+                var descriptor = blueprint.SpellDescriptor;
+
+                // Heal 계열 감지 (SpellDescriptor.RestoreHP + 상태이상 해제 효과 확인)
+                // Heal 주문은 RestoreHP와 함께 상태이상 해제 효과가 있음
+                if ((descriptor & SpellDescriptor.RestoreHP) != 0)
+                {
+                    // Heal 주문인지 확인 (Heal은 보통 많은 HP 회복 + 상태이상 해제)
+                    // ContextActionHealStatDamage나 ContextActionRemoveBuffsByDescriptor가 있으면 Heal 계열
+                    info.IsHeal = false;  // 나중에 컴포넌트 분석에서 설정
+                }
+
+                // 2. 컴포넌트 분석 (ContextActionRemoveBuff, ContextActionDispelMagic 등)
+                var runAction = blueprint.GetComponent<AbilityEffectRunAction>();
+                if (runAction?.Actions?.Actions != null)
+                {
+                    foreach (var action in runAction.Actions.Actions)
+                    {
+                        if (action == null) continue;
+
+                        // ContextActionDispelMagic - 마법 해제
+                        if (action is ContextActionDispelMagic)
+                        {
+                            info.RemovesAny = true;
+                        }
+
+                        // ContextActionRemoveBuff - 특정 버프 제거
+                        if (action is ContextActionRemoveBuff removeBuff && removeBuff.Buff != null)
+                        {
+                            var buffDesc = removeBuff.Buff.SpellDescriptor;
+                            if ((buffDesc & SpellDescriptor.Fear) != 0 ||
+                                (buffDesc & SpellDescriptor.Shaken) != 0 ||
+                                (buffDesc & SpellDescriptor.Frightened) != 0)
+                                info.RemovesFear = true;
+
+                            if ((buffDesc & SpellDescriptor.Paralysis) != 0)
+                                info.RemovesParalysis = true;
+
+                            if ((buffDesc & SpellDescriptor.MovementImpairing) != 0)
+                                info.RemovesMovement = true;
+
+                            if ((buffDesc & SpellDescriptor.Disease) != 0)
+                                info.RemovesDisease = true;
+
+                            if ((buffDesc & SpellDescriptor.Curse) != 0)
+                                info.RemovesCurse = true;
+
+                            if ((buffDesc & SpellDescriptor.Poison) != 0)
+                                info.RemovesPoison = true;
+                        }
+
+                        // ContextActionRemoveBuffsByDescriptor - 타입별 버프 제거
+                        if (action is ContextActionRemoveBuffsByDescriptor removeByDesc)
+                        {
+                            var targetDesc = removeByDesc.SpellDescriptor;
+                            if ((targetDesc & SpellDescriptor.Fear) != 0)
+                                info.RemovesFear = true;
+                            if ((targetDesc & SpellDescriptor.Paralysis) != 0)
+                                info.RemovesParalysis = true;
+                            if ((targetDesc & SpellDescriptor.MovementImpairing) != 0)
+                                info.RemovesMovement = true;
+                            if ((targetDesc & SpellDescriptor.Disease) != 0)
+                                info.RemovesDisease = true;
+                            if ((targetDesc & SpellDescriptor.Curse) != 0)
+                                info.RemovesCurse = true;
+                            if ((targetDesc & SpellDescriptor.Poison) != 0)
+                                info.RemovesPoison = true;
+                        }
+
+                        // Restoration 계열 (HealStatDamage, RestoreResource 등)
+                        if (action is ContextActionHealStatDamage)
+                        {
+                            info.IsRestoration = true;
+                        }
+                    }
+                }
+
+                // 3. AbilityExecuteActionOnCast 등 다른 컴포넌트도 체크
+                var executeOnCast = blueprint.GetComponent<AbilityExecuteActionOnCast>();
+                if (executeOnCast?.Actions?.Actions != null)
+                {
+                    foreach (var action in executeOnCast.Actions.Actions)
+                    {
+                        if (action is ContextActionDispelMagic)
+                            info.RemovesAny = true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[AbilityClassifier] AnalyzeCCRemoval error for {blueprint?.name}: {ex.Message}");
+            }
+
+            return info;
+        }
+
+        /// <summary>
+        /// ★ v0.2.62: CC 해제 캐시 초기화
+        /// </summary>
+        public static void ClearCCRemovalCache()
+        {
+            _ccRemovalCache.Clear();
+            Main.Log("[AbilityClassifier] CC Removal cache cleared");
         }
 
         #endregion
