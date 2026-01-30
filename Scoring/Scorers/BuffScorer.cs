@@ -3,6 +3,7 @@
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
 // ★ v0.2.39: 버프 전투 가치 분석 (CombatValue Consideration)
 // ★ v0.2.40: 인챈트 주문 지원 및 IsAlreadyApplied 버그 수정
+// ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
 using System;
 using System.Linq;
 using Kingmaker.EntitySystem.Entities;
@@ -55,11 +56,14 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             try
             {
                 var target = candidate.Target ?? situation.Unit;
-                float targetHP = GetHPPercent(target);
+
+                // ★ v0.2.52: TargetAnalyzer 통합 사용
+                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
+                float targetHP = analysis?.HPPercent ?? 100f;
                 bool isSelf = target == situation.Unit;
 
                 // ★ v0.2.37: Consideration 기반 점수 구축
-                BuildHealConsiderations(candidate, situation, target, targetHP, isSelf, weights);
+                BuildHealConsiderations(candidate, situation, target, analysis, isSelf, weights);
 
                 // ═══════════════════════════════════════════════════════════════
                 // 1. ★ v0.2.36: Use enhanced TargetScorer for ally scoring
@@ -113,26 +117,30 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 }
 
                 // ═══════════════════════════════════════════════════════════════
-                // 5. ★ v0.2.36: 타겟 역할 기반 힐 우선순위
+                // 5. ★ v0.2.52: 타겟 역할 기반 힐 우선순위 (TargetAnalyzer 사용)
                 // ═══════════════════════════════════════════════════════════════
-                if (!isSelf)
+                if (!isSelf && analysis != null)
                 {
-                    var targetRole = GetTargetRole(target);
-                    switch (targetRole)
+                    // TargetRole → AIRole 변환하여 점수 적용
+                    switch (analysis.EstimatedRole)
                     {
-                        case AIRole.Tank:
+                        case TargetRole.Tank:
                             score += 15f;  // 탱크 유지 중요
                             break;
-                        case AIRole.Support:
+                        case TargetRole.Healer:
                             score += 20f;  // 힐러가 죽으면 파티 붕괴
                             break;
-                        case AIRole.DPS:
-                            score += 10f;
+                        case TargetRole.Caster:
+                            score += 12f;  // 캐스터 보호
+                            break;
+                        case TargetRole.Melee:
+                        case TargetRole.Ranged:
+                            score += 10f;  // DPS
                             break;
                     }
 
-                    // 교전 중인 아군 우선 힐
-                    int engagedEnemies = CountEngagedEnemies(target);
+                    // ★ v0.2.52: 교전 중인 아군 우선 힐 (캐시된 값 사용)
+                    int engagedEnemies = analysis.EngagedEnemyCount;
                     if (engagedEnemies > 0 && targetHP < 50f)
                         score += engagedEnemies * 8f;
                 }
@@ -175,58 +183,8 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
         }
 
-        /// <summary>
-        /// ★ v0.2.36: 타겟 역할 추론
-        /// </summary>
-        private AIRole GetTargetRole(UnitEntityData unit)
-        {
-            try
-            {
-                string charId = unit?.UniqueId ?? "";
-                if (!string.IsNullOrEmpty(charId) && ModSettings.Instance != null)
-                {
-                    var settings = ModSettings.Instance.GetOrCreateSettings(charId, unit.CharacterName);
-                    if (settings != null)
-                        return settings.Role;
-                }
-
-                // 스탯 기반 추론
-                if (unit?.Stats == null)
-                    return AIRole.DPS;
-
-                int ac = unit.Stats.AC?.ModifiedValue ?? 10;
-                int con = unit.Stats.Constitution?.ModifiedValue ?? 10;
-                if (ac >= 25 && con >= 14)
-                    return AIRole.Tank;
-
-                // Spellbook 있으면 Support 가능성
-                var spellbooks = unit.Descriptor?.Spellbooks;
-                if (spellbooks != null)
-                {
-                    foreach (var sb in spellbooks)
-                    {
-                        if (sb.CasterLevel > 0)
-                            return AIRole.Support;
-                    }
-                }
-
-                return AIRole.DPS;
-            }
-            catch { return AIRole.DPS; }
-        }
-
-        /// <summary>
-        /// ★ v0.2.36: 유닛이 교전 중인 적 수
-        /// </summary>
-        private int CountEngagedEnemies(UnitEntityData unit)
-        {
-            try
-            {
-                var engaged = unit?.CombatState?.EngagedUnits;
-                return engaged?.Count ?? 0;
-            }
-            catch { return 0; }
-        }
+        // ★ v0.2.52: GetTargetRole, CountEngagedEnemies 삭제됨
+        // → TargetAnalyzer.Analyze().EstimatedRole, .EngagedEnemyCount 사용
 
         #endregion
 
@@ -245,8 +203,11 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 var target = candidate.Target ?? situation.Unit;
                 bool isSelf = target == situation.Unit;
 
+                // ★ v0.2.52: TargetAnalyzer 통합 사용
+                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
+
                 // ★ v0.2.37: Consideration 기반 점수 구축
-                BuildBuffConsiderations(candidate, situation, target, isSelf, weights);
+                BuildBuffConsiderations(candidate, situation, target, analysis, isSelf, weights);
 
                 // 1. Already buffed check (diminishing returns)
                 int currentBuffCount = CountActiveBuffs(target);
@@ -296,11 +257,11 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                     }
                 }
 
-                // 4. Target selection for ally buffs
-                if (!isSelf)
+                // 4. ★ v0.2.52: Target selection for ally buffs (TargetAnalyzer 사용)
+                if (!isSelf && analysis != null)
                 {
                     // Prioritize buffing allies who will benefit most
-                    float targetHP = GetHPPercent(target);
+                    float targetHP = analysis.HPPercent;
 
                     // Don't buff dying allies (heal them instead)
                     if (targetHP < 30f)
@@ -338,17 +299,20 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// 힐링 행동에 대한 Consideration 구축
+        /// ★ v0.2.52: TargetAnalysis 파라미터 사용
         /// </summary>
         private void BuildHealConsiderations(ActionCandidate candidate, Situation situation,
-            UnitEntityData target, float targetHP, bool isSelf, PhaseRoleWeights weights)
+            UnitEntityData target, TargetAnalysis analysis, bool isSelf, PhaseRoleWeights weights)
         {
             var cs = candidate.Considerations;
             cs.Clear();
 
+            float targetHP = analysis?.HPPercent ?? 100f;
+
             // ═══════════════════════════════════════════════════════════════
-            // 1. 힐 필요도 (가장 중요)
+            // 1. ★ v0.2.52: 힐 필요도 (TargetNormalizer 사용)
             // ═══════════════════════════════════════════════════════════════
-            cs.Add("HealNeed", ScoreNormalizer.HealNeed(targetHP));
+            cs.Add("HealNeed", TargetNormalizer.HPUrgency(targetHP));
 
             // ═══════════════════════════════════════════════════════════════
             // 2. 전투 페이즈 적합성
@@ -362,27 +326,12 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             cs.Add("RoleFit", ScoreNormalizer.RoleActionFit(casterRole, CandidateType.Heal));
 
             // ═══════════════════════════════════════════════════════════════
-            // 4. 타겟 역할 중요도
+            // 4. ★ v0.2.52: 타겟 역할 중요도 (TargetNormalizer 사용)
             // ═══════════════════════════════════════════════════════════════
-            if (!isSelf)
+            if (!isSelf && analysis != null)
             {
-                var targetRole = GetTargetRole(target);
-                float roleImportance;
-                switch (targetRole)
-                {
-                    case AIRole.Support:
-                        roleImportance = 1.0f;  // 힐러 생존 최우선
-                        break;
-                    case AIRole.Tank:
-                        roleImportance = 0.9f;  // 탱커 유지 중요
-                        break;
-                    case AIRole.DPS:
-                        roleImportance = 0.7f;  // 딜러도 중요
-                        break;
-                    default:
-                        roleImportance = 0.6f;
-                        break;
-                }
+                // TargetNormalizer.AllyRoleValue 사용
+                float roleImportance = TargetNormalizer.AllyRoleValue(analysis.EstimatedRole);
                 cs.Add("TargetImportance", roleImportance);
             }
             else
@@ -427,9 +376,10 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
         /// <summary>
         /// 버프 행동에 대한 Consideration 구축
         /// ★ v0.2.39: CombatValue consideration 추가
+        /// ★ v0.2.52: TargetAnalysis 파라미터 사용
         /// </summary>
         private void BuildBuffConsiderations(ActionCandidate candidate, Situation situation,
-            UnitEntityData target, bool isSelf, PhaseRoleWeights weights)
+            UnitEntityData target, TargetAnalysis analysis, bool isSelf, PhaseRoleWeights weights)
         {
             var cs = candidate.Considerations;
             cs.Clear();
@@ -481,9 +431,9 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             cs.Add("BuffStackValue", Mathf.Clamp(normalizedStackValue, 0.25f, 1.0f));
 
             // ═══════════════════════════════════════════════════════════════
-            // 6. 타겟 HP (죽어가는 아군에게 버프 낭비 방지)
+            // 6. ★ v0.2.52: 타겟 HP (TargetAnalyzer 사용)
             // ═══════════════════════════════════════════════════════════════
-            float targetHP = GetHPPercent(target);
+            float targetHP = analysis?.HPPercent ?? 100f;
             float hpFactor = targetHP > 70f ? 1f : (targetHP > 30f ? 0.6f : 0.2f);
             cs.Add("TargetHP", hpFactor);
 
@@ -513,18 +463,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         #region Helper Methods
 
-        private float GetHPPercent(UnitEntityData unit)
-        {
-            try
-            {
-                if (unit?.Stats?.HitPoints == null) return 100f;
-                float current = unit.Stats.HitPoints.ModifiedValue;
-                float max = unit.Stats.HitPoints.BaseValue;
-                if (max <= 0) return 100f;
-                return (current / max) * 100f;
-            }
-            catch { return 100f; }
-        }
+        // ★ v0.2.52: GetHPPercent 삭제됨 → TargetAnalyzer.Analyze().HPPercent 사용
 
         private int CountActiveBuffs(UnitEntityData unit)
         {

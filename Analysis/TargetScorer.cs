@@ -1,3 +1,4 @@
+// ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -12,6 +13,7 @@ namespace CompanionAI_Pathfinder.Analysis
     /// <summary>
     /// 타겟 스코어링 시스템
     /// Role별 가중치를 적용하여 최적 타겟 선택
+    /// ★ v0.2.52: TargetAnalyzer와 통합 - 캐시된 분석 데이터 활용
     /// </summary>
     public static class TargetScorer
     {
@@ -81,6 +83,7 @@ namespace CompanionAI_Pathfinder.Analysis
         /// AIRole 기반 적 타겟 점수 계산
         /// RealTimeController에서 사용
         /// v0.2.17: 킬 확정 보너스, 적 역할 감지 추가
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         public static float ScoreTarget(UnitEntityData attacker, UnitEntityData target, AIRole role)
         {
@@ -97,8 +100,11 @@ namespace CompanionAI_Pathfinder.Analysis
 
             try
             {
+                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                var analysis = TargetAnalyzer.Analyze(target, attacker);
+
                 // 1. HP% 점수 (낮을수록 높음)
-                float hpPercent = GetHPPercent(target);
+                float hpPercent = analysis?.HPPercent ?? 100f;
                 float hpScore = (100f - hpPercent) * 0.5f;
                 score += hpScore * weights.HPPercent;
 
@@ -111,8 +117,8 @@ namespace CompanionAI_Pathfinder.Analysis
 
                 score += distanceScore * weights.Distance;
 
-                // 3. 위협도 평가
-                float threat = EvaluateThreatSimple(target, attacker);
+                // 3. 위협도 평가 - ★ v0.2.52: TargetAnalyzer 사용
+                float threat = analysis?.ThreatLevel ?? 0.5f;
                 score += threat * 30f * weights.Threat;
 
                 // 4. v0.2.17: 킬 확정 보너스 - HP가 매우 낮으면 마무리 우선
@@ -125,17 +131,17 @@ namespace CompanionAI_Pathfinder.Analysis
                 float roleBonus = EvaluateEnemyRolePriority(target);
                 score += roleBonus;
 
-                // 6. v0.2.18: AC 기반 타겟팅 - 물리 공격자만
+                // 6. v0.2.18: AC 기반 타겟팅 - 물리 공격자만 - ★ v0.2.52: TargetAnalyzer 사용
                 if (IsPhysicalAttacker(attacker))
                 {
-                    int targetAC = GetTargetAC(target);
+                    int targetAC = analysis?.AC ?? 20;
                     float acScore = (30f - targetAC) * 1.0f; // AC 10→+20, AC 30→0, AC 40→-10
                     score += acScore * weights.ACVulnerability;
                     Main.Verbose($"[TargetScorer] {target.CharacterName}: AC={targetAC}, acBonus={acScore * weights.ACVulnerability:F1}");
                 }
 
-                // 7. v0.2.18: 플랭킹 보너스
-                if (IsTargetFlanked(target))
+                // 7. v0.2.18: 플랭킹 보너스 - ★ v0.2.52: TargetAnalyzer 사용
+                if (analysis?.IsFlanked ?? false)
                 {
                     score += 15f; // 플랭킹 = 공격 +2 보너스 반영
                     if (HasSneakAttack(attacker))
@@ -165,34 +171,7 @@ namespace CompanionAI_Pathfinder.Analysis
             }
         }
 
-        /// <summary>
-        /// 간단한 위협도 평가 (Situation 없이)
-        /// </summary>
-        private static float EvaluateThreatSimple(UnitEntityData target, UnitEntityData from)
-        {
-            float threat = 0f;
-
-            try
-            {
-                float hpPercent = GetHPPercent(target);
-                float hpNormalized = hpPercent / 100f;
-                threat += hpNormalized * 0.4f;
-
-                float distance = GetDistance(from, target);
-                float maxRange = 30f;
-                float proximityNormalized = 1f - Math.Min(1f, distance / maxRange);
-                threat += proximityNormalized * 0.4f;
-
-                if (HasRangedWeapon(target))
-                    threat += 0.2f;
-            }
-            catch
-            {
-                return 0.5f;
-            }
-
-            return Math.Max(0f, Math.Min(1f, threat));
-        }
+        // ★ v0.2.52: EvaluateThreatSimple() 삭제됨 - TargetAnalyzer.ThreatLevel 사용
 
         // Support 아군 타겟 가중치
         public static readonly AllyWeights SupportAllyWeights = new AllyWeights
@@ -208,6 +187,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// Role 기반 적 타겟 점수 계산
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         public static float ScoreEnemy(
             UnitEntityData target,
@@ -227,8 +207,11 @@ namespace CompanionAI_Pathfinder.Analysis
 
             try
             {
+                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
+
                 // 1. HP% 점수 (낮을수록 높음) - 마무리 타겟 우선
-                float hpPercent = GetHPPercent(target);
+                float hpPercent = analysis?.HPPercent ?? 100f;
                 float hpScore = (100f - hpPercent) * 0.5f;  // 0~50
                 score += hpScore * weights.HPPercent;
 
@@ -249,8 +232,8 @@ namespace CompanionAI_Pathfinder.Analysis
                 else
                     score -= 15f;
 
-                // 4. 위협도 평가 (간소화: HP 기반)
-                float threat = EvaluateThreat(target, situation);
+                // 4. 위협도 평가 - ★ v0.2.52: TargetAnalyzer 사용
+                float threat = analysis?.ThreatLevel ?? 0.5f;
                 score += threat * 30f * weights.Threat;
 
                 // 5. v0.2.17: 킬 확정 보너스
@@ -263,16 +246,16 @@ namespace CompanionAI_Pathfinder.Analysis
                 float roleBonus = EvaluateEnemyRolePriority(target);
                 score += roleBonus;
 
-                // 7. v0.2.18: AC 기반 타겟팅 - 물리 공격자만
+                // 7. v0.2.18: AC 기반 타겟팅 - 물리 공격자만 - ★ v0.2.52: TargetAnalyzer 사용
                 if (situation.Unit != null && IsPhysicalAttacker(situation.Unit))
                 {
-                    int targetAC = GetTargetAC(target);
+                    int targetAC = analysis?.AC ?? 20;
                     float acScore = (30f - targetAC) * 1.0f;
                     score += acScore * weights.ACVulnerability;
                 }
 
-                // 8. v0.2.18: 플랭킹 보너스
-                if (IsTargetFlanked(target))
+                // 8. v0.2.18: 플랭킹 보너스 - ★ v0.2.52: TargetAnalyzer 사용
+                if (analysis?.IsFlanked ?? false)
                 {
                     score += 15f;
                     if (situation.HasSneakAttack)
@@ -357,6 +340,7 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>
         /// ★ v0.2.36: 향상된 아군 힐 대상 점수 계산
         /// HP 단계별 긴급도 + 역할 가중치 + 위협 상황 고려
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         public static float ScoreAllyForHealing(
             UnitEntityData ally,
@@ -374,7 +358,9 @@ namespace CompanionAI_Pathfinder.Analysis
 
             try
             {
-                float hpPercent = GetHPPercent(ally);
+                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                var analysis = TargetAnalyzer.Analyze(ally, situation.Unit);
+                float hpPercent = analysis?.HPPercent ?? 100f;
 
                 // ═══════════════════════════════════════════════════════════════
                 // 1. HP 단계별 긴급도 (핵심 로직)
@@ -404,18 +390,20 @@ namespace CompanionAI_Pathfinder.Analysis
                 }
 
                 // ═══════════════════════════════════════════════════════════════
-                // 2. 역할 기반 가중치 (탱크 > DPS > Support)
+                // 2. 역할 기반 가중치 (탱크 > DPS > Support) - ★ v0.2.52: TargetAnalyzer 사용
                 // ═══════════════════════════════════════════════════════════════
-                var allyRole = GetUnitRole(ally);
+                var allyRole = analysis?.EstimatedRole ?? TargetRole.Melee;
                 switch (allyRole)
                 {
-                    case AIRole.Tank:
+                    case TargetRole.Tank:
                         score += 25f;  // 전선 유지 중요
                         break;
-                    case AIRole.DPS:
+                    case TargetRole.Ranged:
+                    case TargetRole.Melee:
                         score += 15f;  // 화력 유지
                         break;
-                    case AIRole.Support:
+                    case TargetRole.Caster:
+                    case TargetRole.Healer:
                         score += 20f;  // 힐러가 죽으면 파티 붕괴
                         break;
                 }
@@ -502,63 +490,7 @@ namespace CompanionAI_Pathfinder.Analysis
             return null;
         }
 
-        /// <summary>
-        /// ★ v0.2.36: 유닛 역할 추론 (캐릭터 설정 또는 스탯 기반)
-        /// </summary>
-        private static AIRole GetUnitRole(UnitEntityData unit)
-        {
-            try
-            {
-                // 먼저 ModSettings에서 설정된 역할 확인
-                string charId = unit?.UniqueId ?? "";
-                if (!string.IsNullOrEmpty(charId) && ModSettings.Instance != null)
-                {
-                    var settings = ModSettings.Instance.GetOrCreateSettings(charId, unit.CharacterName);
-                    if (settings != null)
-                        return settings.Role;
-                }
-
-                // 설정 없으면 스탯 기반 추론
-                if (unit?.Stats == null)
-                    return AIRole.DPS;
-
-                int str = unit.Stats.Strength?.ModifiedValue ?? 10;
-                int dex = unit.Stats.Dexterity?.ModifiedValue ?? 10;
-                int con = unit.Stats.Constitution?.ModifiedValue ?? 10;
-                int wis = unit.Stats.Wisdom?.ModifiedValue ?? 10;
-                int cha = unit.Stats.Charisma?.ModifiedValue ?? 10;
-                int inte = unit.Stats.Intelligence?.ModifiedValue ?? 10;
-
-                // AC와 HP가 높으면 Tank
-                int ac = unit.Stats.AC?.ModifiedValue ?? 10;
-                if (ac >= 25 && con >= 14)
-                    return AIRole.Tank;
-
-                // 캐스터 스탯(Wis/Cha/Int) + Spellbook 있으면 Support
-                bool hasCaster = false;
-                var spellbooks = unit.Descriptor?.Spellbooks;
-                if (spellbooks != null)
-                {
-                    foreach (var sb in spellbooks)
-                    {
-                        if (sb.CasterLevel > 0)
-                        {
-                            hasCaster = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (hasCaster && (wis >= 16 || cha >= 16 || inte >= 16))
-                    return AIRole.Support;
-
-                return AIRole.DPS;
-            }
-            catch
-            {
-                return AIRole.DPS;
-            }
-        }
+        // ★ v0.2.52: GetUnitRole() 삭제됨 - TargetAnalyzer.EstimatedRole 사용
 
         /// <summary>
         /// ★ v0.2.36: 유닛이 교전 중인 적 수
@@ -580,6 +512,7 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>
         /// ★ v0.2.36: 향상된 디버프 타겟 스코어링
         /// 세이브 약점 + 전투 페이즈 + 기존 디버프 체크 + 면역 체크
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         public static float ScoreDebuffTarget(UnitEntityData target, SavingThrowType saveType, Situation situation,
             bool isMindAffecting = false, bool isHardCC = false)
@@ -591,30 +524,37 @@ namespace CompanionAI_Pathfinder.Analysis
 
             try
             {
+                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                var analysis = TargetAnalyzer.Analyze(target, situation?.Unit);
+
                 // ═══════════════════════════════════════════════════════════════
-                // 1. 면역 체크 (가장 먼저)
+                // 1. 면역 체크 (가장 먼저) - ★ v0.2.52: TargetAnalyzer 사용
                 // ═══════════════════════════════════════════════════════════════
-                if (isMindAffecting && IsMindAffectingImmune(target))
+                if (isMindAffecting && (analysis?.IsMindAffectingImmune ?? false))
                 {
                     Main.Verbose($"[TargetScorer] {target.CharacterName}: Mind-affecting IMMUNE");
                     return -1000f;  // 면역이면 타겟 불가
                 }
 
                 // ═══════════════════════════════════════════════════════════════
-                // 2. 세이브 기반 점수 - 약한 세이브 공략
+                // 2. 세이브 기반 점수 - 약한 세이브 공략 - ★ v0.2.52: TargetAnalyzer 사용
                 // ═══════════════════════════════════════════════════════════════
-                int saveValue = GetSaveValue(target, saveType);
-                int fortSave = GetSaveValue(target, SavingThrowType.Fortitude);
-                int refSave = GetSaveValue(target, SavingThrowType.Reflex);
-                int willSave = GetSaveValue(target, SavingThrowType.Will);
-                int minSave = Math.Min(Math.Min(fortSave, refSave), willSave);
-                int maxSave = Math.Max(Math.Max(fortSave, refSave), willSave);
+                var weakestSave = analysis?.WeakestSaveType ?? SavingThrowType.Will;
+                int saveValue = GetSaveValue(target, saveType);  // 아직 절대값 필요
 
-                // 약한 세이브 공략 보너스
-                if (saveValue == minSave)
+                // 약한 세이브 공략 보너스 - 타겟 세이브가 가장 약한 세이브인지 확인
+                if (saveType == weakestSave)
                     score += 25f;  // 가장 약한 세이브 타겟팅
-                else if (saveValue == maxSave)
-                    score -= 15f;  // 가장 강한 세이브 피하기
+                else
+                {
+                    // 가장 강한 세이브 피하기 - 간략화된 체크
+                    int fortSave = analysis?.FortitudeSave ?? 10;
+                    int refSave = analysis?.ReflexSave ?? 10;
+                    int willSave = analysis?.WillSave ?? 10;
+                    int maxSave = Math.Max(Math.Max(fortSave, refSave), willSave);
+                    if (saveValue == maxSave)
+                        score -= 15f;
+                }
 
                 // 절대값 기반 추가 점수
                 score += (15f - saveValue) * 1.5f;  // save +5 → +15점, save +20 → -7.5점
@@ -628,9 +568,9 @@ namespace CompanionAI_Pathfinder.Analysis
                 score += roleBonus;
 
                 // ═══════════════════════════════════════════════════════════════
-                // 4. HP 기반 가치 판단
+                // 4. HP 기반 가치 판단 - ★ v0.2.52: TargetAnalyzer 사용
                 // ═══════════════════════════════════════════════════════════════
-                float hp = GetHPPercent(target);
+                float hp = analysis?.HPPercent ?? 100f;
                 if (hp > 80f)
                     score += 15f;  // 만피 적 = CC 가치 높음
                 else if (hp > 50f)
@@ -694,7 +634,7 @@ namespace CompanionAI_Pathfinder.Analysis
                         score -= (dist - 15f) * 1f;  // 15m 이후 거리 패널티
                 }
 
-                Main.Verbose($"[TargetScorer] DebuffTarget {target.CharacterName}: save{saveType}={saveValue}(min={minSave}), HP={hp:F0}%, score={score:F1}");
+                Main.Verbose($"[TargetScorer] DebuffTarget {target.CharacterName}: save{saveType}={saveValue}(weak={weakestSave}), HP={hp:F0}%, score={score:F1}");
             }
             catch (Exception ex)
             {
@@ -704,52 +644,10 @@ namespace CompanionAI_Pathfinder.Analysis
             return score;
         }
 
-        /// <summary>
-        /// ★ v0.2.36: 마인드어페팅 면역 체크
-        /// 언데드, 구조물, 엘프(Sleep 면역) 등
-        /// </summary>
-        private static bool IsMindAffectingImmune(UnitEntityData unit)
-        {
-            try
-            {
-                if (unit?.Descriptor == null)
-                    return false;
-
-                // Blueprint type 체크 (언데드, 구조물)
-                var blueprint = unit.Descriptor.Blueprint;
-                if (blueprint?.Type != null)
-                {
-                    string typeName = blueprint.Type.name?.ToLower() ?? "";
-                    if (typeName.Contains("undead") || typeName.Contains("construct") ||
-                        typeName.Contains("ooze") || typeName.Contains("vermin") ||
-                        typeName.Contains("언데드") || typeName.Contains("구조물"))
-                    {
-                        return true;
-                    }
-                }
-
-                // Feature 기반 면역 체크
-                var features = unit.Descriptor?.Progression?.Features?.Enumerable;
-                if (features != null)
-                {
-                    foreach (var f in features)
-                    {
-                        string fName = f.Blueprint?.name?.ToLower() ?? "";
-                        if (fName.Contains("immunemind") || fName.Contains("mindaffecting") ||
-                            fName.Contains("immunityimmune"))
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                return false;
-            }
-            catch { return false; }
-        }
+        // ★ v0.2.52: IsMindAffectingImmune() 삭제됨 - TargetAnalyzer.IsMindAffectingImmune 사용
 
         /// <summary>
-        /// v0.2.18: 세이브 값 조회
+        /// v0.2.18: 세이브 값 조회 (절대값 필요 시 사용)
         /// </summary>
         private static int GetSaveValue(UnitEntityData unit, SavingThrowType saveType)
         {
@@ -837,51 +735,7 @@ namespace CompanionAI_Pathfinder.Analysis
             catch { return float.MaxValue; }
         }
 
-        /// <summary>
-        /// 위협도 평가 (0.0 ~ 1.0)
-        /// 간소화: HP 기반 + 거리 기반
-        /// </summary>
-        private static float EvaluateThreat(UnitEntityData target, Situation situation)
-        {
-            float threat = 0f;
-
-            try
-            {
-                // 1. HP 기반 - 만피일수록 위협적
-                float hpPercent = GetHPPercent(target);
-                float hpNormalized = hpPercent / 100f;  // 0~1 (0=빈사, 1=만피)
-                threat += hpNormalized * 0.4f;
-
-                // 2. 거리 기반 - 가까울수록 위협적
-                float distance = GetDistance(situation.Unit, target);
-                float maxRange = 30f;
-                float proximityNormalized = 1f - Math.Min(1f, distance / maxRange);
-                threat += proximityNormalized * 0.4f;
-
-                // 3. 원거리 무기 보유 시 추가 위협
-                if (HasRangedWeapon(target))
-                    threat += 0.2f;
-            }
-            catch (Exception ex)
-            {
-                Main.Verbose($"[TargetScorer] EvaluateThreat error: {ex.Message}");
-                return 0.5f;  // 폴백: 중간 위협도
-            }
-
-            return Math.Max(0f, Math.Min(1f, threat));
-        }
-
-        /// <summary>
-        /// v0.2.18: 타겟 AC 값 조회
-        /// </summary>
-        private static int GetTargetAC(UnitEntityData target)
-        {
-            try
-            {
-                return target?.Stats?.AC?.ModifiedValue ?? 20;
-            }
-            catch { return 20; }
-        }
+        // ★ v0.2.52: EvaluateThreat(), GetTargetAC() 삭제됨 - TargetAnalyzer 사용
 
         /// <summary>
         /// v0.2.18: 물리 공격자 여부 (근접 또는 원거리 무기 보유)
@@ -917,19 +771,7 @@ namespace CompanionAI_Pathfinder.Analysis
             catch { return 0; }
         }
 
-        /// <summary>
-        /// v0.2.18: 적이 플랭킹 당하고 있는지 확인
-        /// </summary>
-        private static bool IsTargetFlanked(UnitEntityData target)
-        {
-            try
-            {
-                if (target?.Descriptor?.State?.Features?.CannotBeFlanked == true)
-                    return false;
-                return target?.CombatState?.IsFlanked ?? false;
-            }
-            catch { return false; }
-        }
+        // ★ v0.2.52: IsTargetFlanked() 삭제됨 - TargetAnalyzer.IsFlanked 사용
 
         /// <summary>
         /// v0.2.18: 스닉 어택 보유 여부

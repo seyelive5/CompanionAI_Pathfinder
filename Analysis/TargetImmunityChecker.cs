@@ -54,68 +54,29 @@ namespace CompanionAI_Pathfinder.Analysis
             {
                 // 능력의 SpellDescriptor 가져오기
                 SpellDescriptor abilityDescriptor = GetAbilityDescriptor(ability);
-
-                Main.Verbose($"[ImmunityChecker] Checking {ability.Name} -> {target.CharacterName}: AbilityDesc={abilityDescriptor}");
-
                 if (abilityDescriptor == SpellDescriptor.None)
                     return false;
 
                 // 타겟의 면역 플래그 가져오기
                 SpellDescriptor targetImmunity = GetTargetImmunityFlags(target);
-
-                Main.Verbose($"[ImmunityChecker] {target.CharacterName} immunity flags: {targetImmunity}");
-
                 if (targetImmunity == SpellDescriptor.None)
-                {
-                    // ★ v0.2.48: 면역 감지 실패 시 상세 진단
-                    DiagnoseImmunity(target);
                     return false;
-                }
 
                 // 면역 매칭 체크
                 bool isImmune = (abilityDescriptor & targetImmunity) != 0;
 
                 if (isImmune)
                 {
-                    Main.Log($"[ImmunityChecker] ★ {target.CharacterName} is IMMUNE to {ability.Name} " +
-                        $"(Ability={abilityDescriptor}, Immunity={targetImmunity})");
+                    Main.Log($"[ImmunityChecker] {target.CharacterName} IMMUNE to {ability.Name} " +
+                        $"(Desc={abilityDescriptor & targetImmunity})");
                 }
 
                 return isImmune;
             }
             catch (Exception ex)
             {
-                Main.Error($"[ImmunityChecker] Error checking immunity: {ex.Message}");
+                Main.Error($"[ImmunityChecker] Error: {ex.Message}");
                 return false;
-            }
-        }
-
-        /// <summary>
-        /// ★ v0.2.48: 면역 감지 실패 시 상세 진단
-        /// </summary>
-        private static void DiagnoseImmunity(UnitEntityData target)
-        {
-            try
-            {
-                var descriptor = target?.Descriptor;
-                if (descriptor == null) return;
-
-                Main.Verbose($"[ImmunityChecker] Diagnosing {target.CharacterName}:");
-                Main.Verbose($"  - IsUndead: {descriptor.IsUndead}");
-                Main.Verbose($"  - Facts count: {descriptor.Facts.List.Count}");
-
-                // 모든 Facts 이름 출력 (처음 10개만)
-                int count = 0;
-                foreach (var fact in descriptor.Facts.List)
-                {
-                    if (count >= 10) break;
-                    Main.Verbose($"  - Fact: {fact?.Blueprint?.name ?? "null"}");
-                    count++;
-                }
-            }
-            catch (Exception ex)
-            {
-                Main.Error($"[ImmunityChecker] Diagnose error: {ex.Message}");
             }
         }
 
@@ -167,6 +128,12 @@ namespace CompanionAI_Pathfinder.Analysis
                 CacheTime = currentTime
             };
 
+            // ★ v0.2.52: 면역 플래그 있을 때만 로그 (노이즈 감소)
+            if (immunityFlags != SpellDescriptor.None)
+            {
+                Main.Verbose($"[ImmunityChecker] {target.CharacterName} immunities: {immunityFlags}");
+            }
+
             return immunityFlags;
         }
 
@@ -196,13 +163,18 @@ namespace CompanionAI_Pathfinder.Analysis
                 if (descriptor == null)
                     return result;
 
-                // 모든 Facts (Features, Buffs 등) 순회
-                foreach (var fact in descriptor.Facts.List)
+                // ★ v0.2.52: ToList()로 복사하여 안전하게 순회 (크래시 방지)
+                var factsList = descriptor.Facts?.List;
+                if (factsList == null)
+                    return result;
+
+                var factsSnapshot = factsList.ToList();
+
+                foreach (var fact in factsSnapshot)
                 {
                     if (fact?.Blueprint == null)
                         continue;
 
-                    // BlueprintComponent에서 BuffDescriptorImmunity 찾기
                     var components = fact.Blueprint.ComponentsArray;
                     if (components == null)
                         continue;
@@ -211,16 +183,13 @@ namespace CompanionAI_Pathfinder.Analysis
                     {
                         if (component is BuffDescriptorImmunity immunityComponent)
                         {
-                            // SpellDescriptorWrapper에서 Value 추출
                             var immuneDescriptor = immunityComponent.Descriptor.Value;
                             result |= immuneDescriptor;
-
-                            Main.Verbose($"[ImmunityChecker] {unit.CharacterName} has immunity: {immuneDescriptor} (from {fact.Blueprint.name})");
                         }
                     }
                 }
 
-                // 특수 유닛 타입 기반 면역 체크 (악마, 언데드 등)
+                // 크리처 타입 기반 면역 (언데드 등)
                 result |= GetCreatureTypeImmunity(unit);
             }
             catch (Exception ex)
@@ -245,14 +214,13 @@ namespace CompanionAI_Pathfinder.Analysis
                 if (descriptor == null)
                     return result;
 
-                // 언데드 체크 - UnitDescriptor.IsUndead 사용
+                // 언데드 = Mind-Affecting/Death/Poison/Disease 면역
                 if (descriptor.IsUndead)
                 {
                     result |= SpellDescriptor.MindAffecting;
                     result |= SpellDescriptor.Death;
                     result |= SpellDescriptor.Poison;
                     result |= SpellDescriptor.Disease;
-                    Main.Verbose($"[ImmunityChecker] {unit.CharacterName} is Undead - Mind-Affecting/Death/Poison/Disease immune");
                 }
 
                 // 나머지 크리처 타입(Construct, Vermin, Ooze 등)은

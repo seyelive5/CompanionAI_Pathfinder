@@ -167,6 +167,13 @@ namespace CompanionAI_Pathfinder.GameInterface
             // ★ v0.2.43: 실시간 전투에서는 핵심 조건만 체크
             // 기존 CanAct는 IsInExclusiveState(애니메이션)를 체크하는데, 이것이 stuck되면 AI 전체가 멈춤
             // 대신 치명적인 상태만 체크하고, 애니메이션 상태는 Commands.Empty 체크로 커버
+            // ★ v0.2.52: 탑승된 마운트 체크를 최상단으로 이동 (stuck command 오탐 방지)
+            // 마운트는 라이더가 제어하므로 자체 명령이 시작되지 않음 → "stuck" 오탐 발생
+            if (IsMountBeingRidden(unit))
+            {
+                return;
+            }
+
             var state = unit.Descriptor?.State;
             if (state == null)
             {
@@ -323,13 +330,6 @@ namespace CompanionAI_Pathfinder.GameInterface
                 {
                     Main.Verbose($"[RT] {unitName}: Commands check error: {ex.Message}");
                 }
-                return;
-            }
-
-            // ★ v0.2.41: 탑승된 마운트는 건너뛰기 (라이더가 제어함)
-            // 이 유닛이 누군가의 마운트인지 확인
-            if (IsMountBeingRidden(unit))
-            {
                 return;
             }
 
@@ -603,6 +603,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         /// <summary>
         /// ★ v0.2.30: 이동 실행 - BattlefieldGrid 위치 검증 추가
+        /// ★ v0.2.53: 함정 회피 통합
         /// </summary>
         private void ExecuteMoveAction(UnitEntityData unit, Vector3 destination, string reason)
         {
@@ -610,6 +611,16 @@ namespace CompanionAI_Pathfinder.GameInterface
 
             try
             {
+                // ★ v0.2.53: 함정 회피 체크
+                Vector3 safeDestination = destination;
+                if (TrapAwarenessController.Enabled &&
+                    !TrapAwarenessController.CheckMovementSafety(unit, destination, out safeDestination))
+                {
+                    // 우회 경로로 목적지 변경됨
+                    Main.Log($"[RT] {unitName}: Trap avoidance - redirecting to safe position");
+                    destination = safeDestination;
+                }
+
                 // ★ v0.2.30: BattlefieldGrid로 목표 위치 사전 검증
                 if (!BattlefieldGrid.Instance.ValidateTargetPosition(unit, destination))
                 {

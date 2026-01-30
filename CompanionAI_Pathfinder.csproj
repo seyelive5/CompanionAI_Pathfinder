@@ -40,6 +40,10 @@
       <HintPath>$(ManagedPath)\UnityEngine.TextRenderingModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.AIModule">
+      <HintPath>$(ManagedPath)\UnityEngine.AIModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
 
     <!-- Game Assemblies -->
     <Reference Include="Assembly-CSharp">

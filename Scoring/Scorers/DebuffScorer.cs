@@ -1,6 +1,7 @@
 // ★ v0.2.22: Unified Decision Engine - Debuff/CC Scorer
 // ★ v0.2.36: Enhanced with duplicate debuff check, immunity check, combat phase awareness
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
+// ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -44,14 +45,17 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                     return;
                 }
 
+                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
+
                 // ★ v0.2.37: Consideration 기반 점수 구축
-                BuildConsiderations(candidate, situation, weights);
+                BuildConsiderations(candidate, situation, weights, analysis);
 
                 // ═══════════════════════════════════════════════════════════════
-                // 0. ★ v0.2.36: 면역 체크 (가장 먼저)
+                // 0. ★ v0.2.36/0.2.52: 면역 체크 (가장 먼저) - TargetAnalyzer 사용
                 // ═══════════════════════════════════════════════════════════════
                 bool isMindAffecting = candidate.Classification?.IsMindAffecting ?? false;
-                if (isMindAffecting && IsMindAffectingImmune(target))
+                if (isMindAffecting && (analysis?.IsMindAffectingImmune ?? false))
                 {
                     Main.Verbose($"[DebuffScorer] {candidate.Ability?.Name}: Target {target.CharacterName} is mind-affecting IMMUNE");
                     candidate.BaseScore = -100f;
@@ -180,8 +184,9 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// 디버프/CC 행동에 대한 Consideration 구축
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
-        private void BuildConsiderations(ActionCandidate candidate, Situation situation, PhaseRoleWeights weights)
+        private void BuildConsiderations(ActionCandidate candidate, Situation situation, PhaseRoleWeights weights, TargetAnalysis analysis)
         {
             var cs = candidate.Considerations;
             cs.Clear();
@@ -193,17 +198,16 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             // ═══════════════════════════════════════════════════════════════
             cs.AddVeto("HasTarget", target != null);
 
-            if (target == null)
+            if (target == null || analysis == null)
                 return;
 
             // ═══════════════════════════════════════════════════════════════
-            // 2. 면역 체크 (Veto)
+            // 2. 면역 체크 (Veto) - ★ v0.2.52: TargetAnalyzer 사용
             // ═══════════════════════════════════════════════════════════════
             bool isMindAffecting = candidate.Classification?.IsMindAffecting ?? false;
             if (isMindAffecting)
             {
-                bool immune = IsMindAffectingImmune(target);
-                cs.AddVeto("NotImmune", !immune);
+                cs.AddVeto("NotImmune", !analysis.IsMindAffectingImmune);
             }
 
             // ═══════════════════════════════════════════════════════════════
@@ -213,18 +217,16 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             cs.Add("NotDuplicate", hasSimilar ? 0.2f : 1.0f);
 
             // ═══════════════════════════════════════════════════════════════
-            // 4. 타겟 가치 (위협 기반)
+            // 4. 타겟 가치 (위협 기반) - ★ v0.2.52: TargetAnalyzer 사용
             // ═══════════════════════════════════════════════════════════════
-            float threat = AssessThreat(target, situation);
-            cs.Add("TargetThreat", ScoreNormalizer.Threat(threat));
+            cs.Add("TargetThreat", ScoreNormalizer.Threat(analysis.ThreatLevel));
 
             // ═══════════════════════════════════════════════════════════════
-            // 5. HP 기반 가치 (CC는 체력 높은 적에게 더 유용)
+            // 5. HP 기반 가치 (CC는 체력 높은 적에게 더 유용) - ★ v0.2.52: TargetAnalyzer 사용
             // ═══════════════════════════════════════════════════════════════
-            float targetHP = GetHPPercent(target);
             // HP 높을수록 CC 가치 높음 (죽어가는 적은 그냥 처치)
-            float hpValue = targetHP / 100f;
-            if (targetHP < 30f)
+            float hpValue = analysis.HPPercent / 100f;
+            if (analysis.HPPercent < 30f)
                 hpValue *= 0.5f;  // 거의 죽은 적에게 CC는 낭비
             cs.Add("TargetHP", hpValue);
 
@@ -254,12 +256,13 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
 
             // ═══════════════════════════════════════════════════════════════
-            // 9. 세이브 타입 매칭 (약한 세이브 타겟팅)
+            // 9. 세이브 타입 매칭 (약한 세이브 타겟팅) - ★ v0.2.52: TargetAnalyzer 사용
             // ═══════════════════════════════════════════════════════════════
             var saveType = candidate.Classification?.RequiredSave;
             if (saveType.HasValue)
             {
-                float saveMatchScore = ScoreSaveMatch(target, saveType.Value);
+                // TargetAnalyzer의 WeakestSaveType과 비교
+                float saveMatchScore = TargetNormalizer.WeakSaveBonus(saveType.Value, analysis.WeakestSaveType);
                 cs.Add("SaveMatch", saveMatchScore);
             }
 
@@ -274,42 +277,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             Main.Verbose($"[DebuffScorer] {candidate.Ability?.Name} -> {target.CharacterName}: {cs.ToDebugString()}");
         }
 
-        /// <summary>
-        /// 세이브 타입 매칭 점수
-        /// </summary>
-        private float ScoreSaveMatch(UnitEntityData target, SavingThrowType saveType)
-        {
-            try
-            {
-                int fort = GetSavingThrow(target, SavingThrowType.Fortitude);
-                int refx = GetSavingThrow(target, SavingThrowType.Reflex);
-                int will = GetSavingThrow(target, SavingThrowType.Will);
-
-                int targetSave;
-                switch (saveType)
-                {
-                    case SavingThrowType.Fortitude: targetSave = fort; break;
-                    case SavingThrowType.Reflex: targetSave = refx; break;
-                    case SavingThrowType.Will: targetSave = will; break;
-                    default: return 0.5f;
-                }
-
-                int minSave = Math.Min(Math.Min(fort, refx), will);
-                int maxSave = Math.Max(Math.Max(fort, refx), will);
-
-                // 가장 약한 세이브를 타겟팅하면 높은 점수
-                if (targetSave == minSave)
-                    return 1.0f;
-                else if (targetSave == maxSave)
-                    return 0.4f;
-                else
-                    return 0.7f;
-            }
-            catch
-            {
-                return 0.5f;
-            }
-        }
+        // ★ v0.2.52: ScoreSaveMatch() 삭제됨 - TargetNormalizer.WeakSaveBonus() 사용
 
         #endregion
 
@@ -319,6 +287,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// Score target for debuff application
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         private float ScoreDebuffTarget(UnitEntityData target, Situation situation)
         {
@@ -329,12 +298,15 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
             try
             {
+                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
+
                 // Threat-based (high threat targets are better CC targets)
-                float threat = AssessThreat(target, situation);
+                float threat = analysis?.ThreatLevel ?? 0.5f;
                 score += ResponseCurves.CCTargetValue(threat) * 20f;
 
                 // HP-based (full HP targets benefit more from CC)
-                float hp = GetHPPercent(target);
+                float hp = analysis?.HPPercent ?? 100f;
                 if (hp > 70f)
                     score += 10f;  // Full HP - CC is valuable
                 else if (hp < 30f)
@@ -408,115 +380,11 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         #endregion
 
-        #region Save Type Matching
-
-        /// <summary>
-        /// Score based on save type vs target's weak save
-        /// </summary>
-        private float ScoreSaveTypeMatch(ActionCandidate candidate, Situation situation)
-        {
-            if (candidate.Target == null || candidate.Classification == null)
-                return 0f;
-
-            var saveType = candidate.Classification.RequiredSave;
-            if (!saveType.HasValue)
-                return 0f;
-
-            try
-            {
-                // Get target's saves
-                var target = candidate.Target;
-                int fortSave = GetSavingThrow(target, SavingThrowType.Fortitude);
-                int refSave = GetSavingThrow(target, SavingThrowType.Reflex);
-                int willSave = GetSavingThrow(target, SavingThrowType.Will);
-
-                int targetSave = 0;
-                int minSave = Math.Min(Math.Min(fortSave, refSave), willSave);
-
-                switch (saveType.Value)
-                {
-                    case SavingThrowType.Fortitude:
-                        targetSave = fortSave;
-                        break;
-                    case SavingThrowType.Reflex:
-                        targetSave = refSave;
-                        break;
-                    case SavingThrowType.Will:
-                        targetSave = willSave;
-                        break;
-                }
-
-                // Bonus if targeting weak save
-                if (targetSave == minSave)
-                    return 15f;  // Targeting weakest save
-
-                // Penalty if targeting strong save
-                int maxSave = Math.Max(Math.Max(fortSave, refSave), willSave);
-                if (targetSave == maxSave)
-                    return -10f;  // Targeting strongest save
-
-                return 0f;
-            }
-            catch
-            {
-                return 0f;
-            }
-        }
-
-        private int GetSavingThrow(UnitEntityData unit, SavingThrowType type)
-        {
-            try
-            {
-                switch (type)
-                {
-                    case SavingThrowType.Fortitude:
-                        return unit?.Stats?.SaveFortitude?.ModifiedValue ?? 10;
-                    case SavingThrowType.Reflex:
-                        return unit?.Stats?.SaveReflex?.ModifiedValue ?? 10;
-                    case SavingThrowType.Will:
-                        return unit?.Stats?.SaveWill?.ModifiedValue ?? 10;
-                    default:
-                        return 10;
-                }
-            }
-            catch
-            {
-                return 10;
-            }
-        }
-
-        #endregion
+        // ★ v0.2.52: Save Type Matching 영역 삭제됨 - TargetAnalyzer/TargetNormalizer 사용
 
         #region Helper Methods
 
-        private float GetHPPercent(UnitEntityData unit)
-        {
-            try
-            {
-                if (unit?.Stats?.HitPoints == null) return 100f;
-                float current = unit.Stats.HitPoints.ModifiedValue;
-                float max = unit.Stats.HitPoints.BaseValue;
-                if (max <= 0) return 100f;
-                return (current / max) * 100f;
-            }
-            catch { return 100f; }
-        }
-
-        private float AssessThreat(UnitEntityData target, Situation situation)
-        {
-            try
-            {
-                float threat = 0.5f;
-                float hp = GetHPPercent(target);
-                if (hp > 80f) threat += 0.2f;
-                if (situation.EnemiesTargetingAllies > 0) threat += 0.15f;
-                return Math.Max(0f, Math.Min(1f, threat));
-            }
-            catch
-            {
-                return 0.5f;
-            }
-        }
+        // ★ v0.2.52: GetHPPercent(), AssessThreat(), IsMindAffectingImmune() 삭제됨 - TargetAnalyzer 사용
 
         private int CountEnemiesInRange(Vector3 center, float radius, Situation situation)
         {
@@ -525,48 +393,6 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
             return situation.Enemies.Count(e =>
                 e != null && Vector3.Distance(center, e.Position) <= radius);
-        }
-
-        /// <summary>
-        /// ★ v0.2.36: 마인드어페팅 면역 체크
-        /// </summary>
-        private bool IsMindAffectingImmune(UnitEntityData unit)
-        {
-            try
-            {
-                if (unit?.Descriptor == null)
-                    return false;
-
-                // Blueprint type 체크 (언데드, 구조물)
-                var blueprint = unit.Descriptor.Blueprint;
-                if (blueprint?.Type != null)
-                {
-                    string typeName = blueprint.Type.name?.ToLower() ?? "";
-                    if (typeName.Contains("undead") || typeName.Contains("construct") ||
-                        typeName.Contains("ooze") || typeName.Contains("vermin") ||
-                        typeName.Contains("언데드") || typeName.Contains("구조물"))
-                    {
-                        return true;
-                    }
-                }
-
-                // Feature 기반 면역 체크
-                var features = unit.Descriptor?.Progression?.Features?.Enumerable;
-                if (features != null)
-                {
-                    foreach (var f in features)
-                    {
-                        string fName = f.Blueprint?.name?.ToLower() ?? "";
-                        if (fName.Contains("immunemind") || fName.Contains("mindaffecting"))
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                return false;
-            }
-            catch { return false; }
         }
 
         /// <summary>

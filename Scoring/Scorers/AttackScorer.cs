@@ -1,6 +1,7 @@
 // ★ v0.2.22: Unified Decision Engine - Attack Scorer
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
 // ★ v0.2.41: Charge ability distance penalty
+// ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -73,6 +74,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// 공격 행동에 대한 Consideration 구축
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         private void BuildConsiderations(ActionCandidate candidate, Situation situation, PhaseRoleWeights weights)
         {
@@ -86,6 +88,9 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
             if (candidate.Target == null)
                 return;  // Veto - 추가 평가 불필요
+
+            // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+            var analysis = TargetAnalyzer.Analyze(candidate.Target, situation.Unit);
 
             // ═══════════════════════════════════════════════════════════════
             // 2. 사거리 (Veto for ability attacks)
@@ -105,10 +110,10 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
 
             // ═══════════════════════════════════════════════════════════════
-            // 3. 타겟 가치 (HP + 위협)
+            // 3. 타겟 가치 (HP + 위협) - ★ v0.2.52: TargetAnalyzer 사용
             // ═══════════════════════════════════════════════════════════════
-            float targetHP = GetHPPercent(candidate.Target);
-            float threat = AssessThreat(candidate.Target, situation);
+            float targetHP = analysis?.HPPercent ?? 100f;
+            float threat = analysis?.ThreatLevel ?? 0.5f;
             cs.Add("TargetValue", ScoreNormalizer.TargetValue(targetHP, threat));
 
             // ═══════════════════════════════════════════════════════════════
@@ -209,6 +214,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// Score the target based on various factors
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         private float ScoreTarget(UnitEntityData target, Situation situation)
         {
@@ -219,12 +225,15 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
             try
             {
+                // ★ v0.2.52: 통합 분석 획득 (캐시됨)
+                var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
+
                 // HP-based priority (lower HP = higher priority)
-                float targetHP = GetHPPercent(target);
+                float targetHP = analysis?.HPPercent ?? 100f;
                 score += ResponseCurves.TargetHPPriority(targetHP) * 15f;
 
                 // Threat assessment
-                float threat = AssessThreat(target, situation);
+                float threat = analysis?.ThreatLevel ?? 0.5f;
                 score += ResponseCurves.CCTargetValue(threat) * 10f;
 
                 // Distance factor
@@ -301,7 +310,9 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
                 // Weapon ability vs spell
                 bool isWeapon = IsWeaponAbility(ability);
-                float targetHP = candidate.Target != null ? GetHPPercent(candidate.Target) : 50f;
+                // ★ v0.2.52: TargetAnalyzer 사용
+                var targetAnalysis = candidate.Target != null ? TargetAnalyzer.Analyze(candidate.Target, situation.Unit) : null;
+                float targetHP = targetAnalysis?.HPPercent ?? 50f;
 
                 // Low HP targets: weapons are efficient
                 if (targetHP <= 30f && isWeapon)
@@ -321,6 +332,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// Score a basic attack (UnitAttack)
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         private float ScoreBasicAttack(ActionCandidate candidate, Situation situation)
         {
@@ -333,8 +345,9 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             if (situation.CombatPhase == CombatPhase.Cleanup)
                 score += 10f;
 
-            // Good against low HP targets
-            float targetHP = candidate.Target != null ? GetHPPercent(candidate.Target) : 50f;
+            // Good against low HP targets - ★ v0.2.52: TargetAnalyzer 사용
+            var analysis = candidate.Target != null ? TargetAnalyzer.Analyze(candidate.Target, situation.Unit) : null;
+            float targetHP = analysis?.HPPercent ?? 50f;
             if (targetHP <= 25f)
                 score += 15f;
 
@@ -357,6 +370,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         /// <summary>
         /// Calculate bonus for potential kills
+        /// ★ v0.2.52: TargetAnalyzer 통합
         /// </summary>
         private float CalculateKillBonus(ActionCandidate candidate, Situation situation, PhaseRoleWeights weights)
         {
@@ -365,7 +379,9 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
             try
             {
-                float targetHP = GetHPPercent(candidate.Target);
+                // ★ v0.2.52: TargetAnalyzer 사용
+                var analysis = TargetAnalyzer.Analyze(candidate.Target, situation.Unit);
+                float targetHP = analysis?.HPPercent ?? 100f;
                 float targetCurrentHP = candidate.Target.Stats?.HitPoints?.ModifiedValue ?? 100f;
 
                 // Estimate damage (rough approximation)
@@ -442,43 +458,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         #region Helper Methods
 
-        private float GetHPPercent(UnitEntityData unit)
-        {
-            try
-            {
-                if (unit?.Stats?.HitPoints == null) return 100f;
-                float current = unit.Stats.HitPoints.ModifiedValue;
-                float max = unit.Stats.HitPoints.BaseValue;
-                if (max <= 0) return 100f;
-                return (current / max) * 100f;
-            }
-            catch { return 100f; }
-        }
-
-        private float AssessThreat(UnitEntityData target, Situation situation)
-        {
-            // Simple threat assessment (0.0 to 1.0)
-            // Could be expanded with more factors
-            try
-            {
-                float threat = 0.5f;
-
-                // HP-based (lower HP = less threat, but killing is valuable)
-                float hp = GetHPPercent(target);
-                if (hp > 80f) threat += 0.2f;
-                else if (hp < 30f) threat -= 0.1f;
-
-                // Targeting allies increases threat
-                if (situation.EnemiesTargetingAllies > 0)
-                    threat += 0.15f;
-
-                return Math.Max(0f, Math.Min(1f, threat));
-            }
-            catch
-            {
-                return 0.5f;
-            }
-        }
+        // ★ v0.2.52: GetHPPercent(), AssessThreat() 삭제됨 - TargetAnalyzer 사용
 
         private bool IsTargetFlanked(UnitEntityData target, Situation situation)
         {
