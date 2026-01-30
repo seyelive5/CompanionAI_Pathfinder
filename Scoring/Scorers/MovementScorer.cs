@@ -1,5 +1,6 @@
 // ★ v0.2.22: Unified Decision Engine - Movement Scorer
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
+// ★ v0.2.50: 이미 최적 위치일 때 이동 점수 대폭 하락 (이동 루프 방지)
 using System;
 using System.Linq;
 using Kingmaker.EntitySystem.Entities;
@@ -247,8 +248,11 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
             // ═══════════════════════════════════════════════════════════════
             // 2. 이동 필요성 (현재 위치에서 공격 가능하면 이동 불필요)
+            // ★ v0.2.50: 이미 최적 위치면 이동 필요성 대폭 하락
             // ═══════════════════════════════════════════════════════════════
             float movementNeed = 0.5f;  // 기본값
+            bool currentInOptimalRange = IsInOptimalRange(situation.NearestEnemyDistance, situation.RangePreference);
+
             if (!situation.HasHittableEnemies && situation.HasLivingEnemies)
             {
                 // 공격할 적이 없으면 이동 필요
@@ -256,18 +260,30 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
             else if (situation.HasHittableEnemies)
             {
-                // 이미 공격 가능하면 이동 덜 필요
-                movementNeed = 0.3f;
+                // 이미 공격 가능
+                if (currentInOptimalRange)
+                {
+                    // ★ v0.2.50: 이미 최적 위치면 이동 거의 불필요
+                    movementNeed = 0.1f;
+                }
+                else
+                {
+                    // 공격은 가능하지만 위치 개선 여지 있음
+                    movementNeed = 0.25f;
+                }
             }
             cs.Add("MovementNeed", movementNeed);
 
             // ═══════════════════════════════════════════════════════════════
             // 3. 거리 개선도 (목표 지점이 더 나은 위치인지)
+            // ★ v0.2.50: 현재 위치가 이미 최적이면 개선도 대폭 하락
             // ═══════════════════════════════════════════════════════════════
             float currentDistToNearest = situation.NearestEnemyDistance;
             float newDistToNearest = GetDistanceToNearestEnemy(destination, situation);
 
             float distanceImprovement = 0.5f;
+            bool newInOptimalRange = IsInOptimalRange(newDistToNearest, situation.RangePreference);
+
             switch (situation.RangePreference)
             {
                 case RangePreference.Melee:
@@ -279,13 +295,29 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                     break;
 
                 case RangePreference.Ranged:
-                    // 원거리: 최적 거리로 이동
-                    if (newDistToNearest >= RANGED_OPTIMAL_MIN && newDistToNearest <= RANGED_OPTIMAL_MAX)
+                    // ★ v0.2.50: 현재와 목적지 모두 최적 범위 체크
+                    if (currentInOptimalRange && newInOptimalRange)
+                    {
+                        // 둘 다 최적이면 이동 불필요
+                        distanceImprovement = 0.15f;
+                    }
+                    else if (!currentInOptimalRange && newInOptimalRange)
+                    {
+                        // 현재 비최적 → 이동 후 최적 = 큰 개선
                         distanceImprovement = 1.0f;
+                    }
+                    else if (newInOptimalRange)
+                    {
+                        distanceImprovement = 0.8f;
+                    }
                     else if (newDistToNearest < DANGER_THRESHOLD)
+                    {
                         distanceImprovement = 0.1f;  // 너무 가까움 = 위험
+                    }
                     else
-                        distanceImprovement = 0.6f;
+                    {
+                        distanceImprovement = 0.5f;
+                    }
                     break;
 
                 default:

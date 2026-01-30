@@ -3,6 +3,7 @@
 // ★ v0.2.41: FinalScore → HybridFinalScore 수정 (Geometric Mean 기반 선택)
 // ★ v0.2.48: SpellDescriptor 면역 체크 추가 (악의 눈→드레치 무한 루프 해결)
 // ★ v0.2.49: AoE 위험 지역 탈출 및 CC 탈출 로직 추가
+// ★ v0.2.50: LOS 체크 추가 + 근접 캐릭터 BasicAttack 이동 거리 고려
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -270,9 +271,20 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
             }
 
             // ★ v0.2.25: Basic attack - 무기 범위 기반 (근접/원거리 모두 지원)
-            // HittableEnemies가 비어있어도 무기 범위 내 적에게 평타 가능
+            // ★ v0.2.50: 근접 캐릭터는 이동 후 공격 가능 거리까지 고려
             var potentialTargets = situation.Enemies ?? Enumerable.Empty<UnitEntityData>();
             float weaponRange = situation.WeaponRange;
+            bool isMelee = weaponRange <= 3f;  // 3m 이하면 근접
+
+            // 근접 캐릭터의 경우 이동 가능 거리 추가 (이동 후 공격 가능)
+            float effectiveRange = weaponRange + 1f;
+            if (isMelee && situation.CanMove)
+            {
+                // 근접 캐릭터가 이동 가능하면 이동 거리 고려
+                // 일반적으로 6초 라운드 기준 30ft(~9m) 이동 가능
+                // 기마 상태 등을 고려해 넉넉하게 설정
+                effectiveRange = weaponRange + 10f;  // 이동 후 공격 가능
+            }
 
             foreach (var enemy in potentialTargets)
             {
@@ -282,10 +294,24 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 float dist = Vector3.Distance(unit.Position, enemy.Position);
 
                 // 무기 범위 내에 있으면 BasicAttack 후보 생성
-                if (dist <= weaponRange + 1f)  // 약간의 여유
+                if (dist <= effectiveRange)
                 {
-                    candidates.Add(ActionCandidate.BasicAttack(enemy));
-                    Main.Verbose($"[DecisionEngine] BasicAttack candidate: {enemy.CharacterName} (dist={dist:F1}m, range={weaponRange:F1}m)");
+                    // ★ v0.2.50: LOS 체크 - 원거리 무기의 경우 시야 차단 확인
+                    bool hasLOS = true;
+                    if (!isMelee && dist > 3f)  // 원거리 공격 시에만 LOS 체크
+                    {
+                        hasLOS = LineOfSightChecker.HasLineOfSight(unit, enemy);
+                    }
+
+                    if (hasLOS)
+                    {
+                        candidates.Add(ActionCandidate.BasicAttack(enemy));
+                        Main.Verbose($"[DecisionEngine] BasicAttack candidate: {enemy.CharacterName} (dist={dist:F1}m, range={weaponRange:F1}m, effective={effectiveRange:F1}m)");
+                    }
+                    else
+                    {
+                        Main.Verbose($"[DecisionEngine] BasicAttack BLOCKED by LOS: {enemy.CharacterName} (dist={dist:F1}m)");
+                    }
                 }
             }
         }

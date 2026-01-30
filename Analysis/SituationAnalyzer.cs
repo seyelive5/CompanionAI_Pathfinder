@@ -379,6 +379,18 @@ namespace CompanionAI_Pathfinder.Analysis
                     hitReason = "Melee reach";
                 }
 
+                // ★ v0.2.50: LOS (Line of Sight) 체크 추가
+                // CanTarget()은 LOS를 체크하지 않으므로 별도 확인 필요
+                if (canHit)
+                {
+                    bool hasLOS = LineOfSightChecker.HasLineOfSight(unit, enemy);
+                    if (!hasLOS)
+                    {
+                        canHit = false;
+                        Main.Verbose($"[Analyzer] {enemy.CharacterName}: LOS blocked (no line of sight)");
+                    }
+                }
+
                 if (canHit)
                 {
                     situation.HittableEnemies.Add(enemy);
