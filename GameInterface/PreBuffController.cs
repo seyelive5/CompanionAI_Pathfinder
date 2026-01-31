@@ -1,12 +1,10 @@
-// ★ v0.2.38: Pre-Combat Buff System
-// 휴식 후 자동 버프 + 핫키 수동 버프
+// ★ v0.2.63: Smart Pre-Combat Buff System
+// 스마트 타겟팅 + 우선순위 기반 버프
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using Kingmaker;
 using Kingmaker.EntitySystem.Entities;
-using Kingmaker.PubSubSystem;
-using Kingmaker.UnitLogic.Abilities;
 using Kingmaker.UnitLogic.Commands;
 using Kingmaker.UnitLogic.Commands.Base;
 using Kingmaker.Utility;
@@ -48,9 +46,10 @@ namespace CompanionAI_Pathfinder.GameInterface
     }
 
     /// <summary>
-    /// Pre-Combat Buff Controller
-    /// - 핫키로 수동 파티 버프
-    /// - 휴식 후 자동 버프 (IRestFinishedHandler)
+    /// ★ v0.2.63: Smart Pre-Combat Buff Controller
+    /// - 스마트 타겟팅 (역할 기반)
+    /// - 우선순위 기반 버프
+    /// - 자원 효율적 사용
     /// </summary>
     public class PreBuffController : IDisposable
     {
@@ -64,15 +63,17 @@ namespace CompanionAI_Pathfinder.GameInterface
         #region Constants
 
         private const float BUFF_INTERVAL = 0.5f;  // 버프 간 간격 (초)
+        private const int MAX_BUFFS_PER_SESSION = 50;  // 한 번에 최대 버프 수
 
         #endregion
 
         #region State
 
-        private bool _isInitialized = false;
         private bool _isBuffing = false;
         private Queue<BuffRequest> _buffQueue = new Queue<BuffRequest>();
         private float _lastBuffTime = 0f;
+        private int _totalBuffsApplied = 0;
+        private int _totalBuffsSkipped = 0;
 
         #endregion
 
@@ -95,15 +96,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         private void Setup()
         {
-            try
-            {
-                _isInitialized = true;
-                Main.Log("[PreBuff] Initialized successfully (use UI button or TriggerPartyBuff())");
-            }
-            catch (Exception ex)
-            {
-                Main.Error($"[PreBuff] Initialization failed: {ex.Message}");
-            }
+            Main.Log("[PreBuff] Smart Pre-Buff System initialized (v0.2.63)");
         }
 
         public void Dispose()
@@ -111,7 +104,6 @@ namespace CompanionAI_Pathfinder.GameInterface
             try
             {
                 PreBuffUpdater.Destroy();
-                _isInitialized = false;
                 _instance = null;
                 Main.Log("[PreBuff] Disposed");
             }
@@ -158,15 +150,18 @@ namespace CompanionAI_Pathfinder.GameInterface
             try
             {
                 _buffQueue.Clear();
-                CollectBuffRequests();
+                _totalBuffsApplied = 0;
+                _totalBuffsSkipped = 0;
+
+                CollectSmartBuffRequests();
 
                 if (_buffQueue.Count == 0)
                 {
-                    Main.Log("[PreBuff] No buffs to apply");
+                    Main.Log("[PreBuff] No buffs to apply (all buffs already active or no valid buffs)");
                     return;
                 }
 
-                Main.Log($"[PreBuff] Queued {_buffQueue.Count} buff(s) to apply");
+                Main.Log($"[PreBuff] ★ Smart buffing: {_buffQueue.Count} buff(s) queued");
                 _isBuffing = true;
                 _lastBuffTime = Time.time;
             }
@@ -177,85 +172,78 @@ namespace CompanionAI_Pathfinder.GameInterface
         }
 
         /// <summary>
-        /// 버프 요청 수집 (모든 파티원의 영구/사전 버프)
+        /// ★ v0.2.63: 스마트 버프 요청 수집
         /// </summary>
-        private void CollectBuffRequests()
+        private void CollectSmartBuffRequests()
         {
             var party = GetPartyMembers();
+            if (party.Count == 0)
+            {
+                Main.Log("[PreBuff] No valid party members");
+                return;
+            }
 
+            var allRequests = new List<BuffRequest>();
+
+            // 각 캐스터별로 분석
             foreach (var caster in party)
             {
                 if (caster == null || caster.HPLeft <= 0)
                     continue;
 
-                // 해당 캐릭터의 사용 가능한 버프 목록
-                var buffs = GetAvailablePreBuffs(caster);
+                // 스마트 분석
+                var analyses = PreBuffAnalyzer.AnalyzeAllPreBuffs(caster, party);
 
-                foreach (var buff in buffs)
+                // 로그: 분석 결과 요약
+                int critical = analyses.Count(a => a.Priority == PreBuffPriority.Critical);
+                int high = analyses.Count(a => a.Priority == PreBuffPriority.High);
+                int medium = analyses.Count(a => a.Priority == PreBuffPriority.Medium);
+
+                if (analyses.Count > 0)
                 {
-                    // 각 파티원에게 적용할 버프 추가
-                    foreach (var target in party)
-                    {
-                        if (target == null || target.HPLeft <= 0)
-                            continue;
-
-                        // 이미 적용된 버프는 스킵
-                        if (AbilityClassifier.IsBuffAlreadyApplied(buff.Ability, target))
-                            continue;
-
-                        // 대상 지정 가능 여부 확인
-                        if (!CanTargetUnit(buff.Ability, caster, target))
-                            continue;
-
-                        _buffQueue.Enqueue(new BuffRequest(caster, target, buff));
-                    }
+                    Main.Verbose($"[PreBuff] {caster.CharacterName}: {analyses.Count} buffs analyzed " +
+                                 $"(Critical={critical}, High={high}, Medium={medium})");
                 }
+
+                // 버프 요청 생성
+                var requests = PreBuffAnalyzer.GenerateBuffRequests(caster, analyses, MAX_BUFFS_PER_SESSION);
+                allRequests.AddRange(requests);
             }
-        }
 
-        /// <summary>
-        /// 사용 가능한 사전 버프 목록
-        /// </summary>
-        private List<AbilityClassification> GetAvailablePreBuffs(UnitEntityData unit)
-        {
-            return AbilityClassifier.ClassifyAllAbilities(unit)
-                .Where(c => c.Timing == AbilityTiming.PermanentBuff ||
-                            c.Timing == AbilityTiming.PreCombatBuff)
-                .Where(c => c.Ability?.IsAvailableForCast ?? false)
-                .Where(c => c.SpellLevel <= 2)  // 저레벨 버프만 (설정으로 변경 가능)
-                .OrderByDescending(c => c.Timing == AbilityTiming.PermanentBuff ? 1 : 0)
-                .ThenBy(c => c.SpellLevel)  // 낮은 레벨 우선
-                .ToList();
-        }
-
-        /// <summary>
-        /// 대상에게 능력 사용 가능 여부
-        /// </summary>
-        private bool CanTargetUnit(AbilityData ability, UnitEntityData caster, UnitEntityData target)
-        {
-            try
+            // 우선순위 순 정렬
+            allRequests.Sort((a, b) =>
             {
-                var bp = ability?.Blueprint;
-                if (bp == null) return false;
+                // 1. Priority 내림차순
+                int priorityA = (int)(a.Analysis?.Priority ?? PreBuffPriority.Skip);
+                int priorityB = (int)(b.Analysis?.Priority ?? PreBuffPriority.Skip);
+                int priorityCompare = priorityB.CompareTo(priorityA);
+                if (priorityCompare != 0) return priorityCompare;
 
-                // 자기 자신만 대상 가능
-                if (bp.CanTargetSelf && !bp.CanTargetFriends && caster == target)
-                    return true;
+                // 2. CombatValue 내림차순
+                float valueA = a.Analysis?.CombatValue ?? 0;
+                float valueB = b.Analysis?.CombatValue ?? 0;
+                return valueB.CompareTo(valueA);
+            });
 
-                // 아군 대상 가능
-                if (bp.CanTargetFriends)
-                    return true;
-
-                // 자기 자신 대상 가능
-                if (bp.CanTargetSelf && caster == target)
-                    return true;
-
-                return false;
-            }
-            catch
+            // 중복 제거 (같은 버프를 같은 대상에게)
+            var seen = new HashSet<string>();
+            foreach (var request in allRequests)
             {
-                return false;
+                if (_buffQueue.Count >= MAX_BUFFS_PER_SESSION)
+                    break;
+
+                string key = $"{request.Ability?.Blueprint?.AssetGuid}_{request.Target?.UniqueId}";
+                if (seen.Contains(key))
+                {
+                    _totalBuffsSkipped++;
+                    continue;
+                }
+                seen.Add(key);
+
+                _buffQueue.Enqueue(request);
             }
+
+            Main.Log($"[PreBuff] Final queue: {_buffQueue.Count} buffs (skipped {_totalBuffsSkipped} duplicates)");
         }
 
         /// <summary>
@@ -269,7 +257,7 @@ namespace CompanionAI_Pathfinder.GameInterface
                 if (_isBuffing && _buffQueue.Count == 0)
                 {
                     _isBuffing = false;
-                    Main.Log("[PreBuff] Buff queue completed");
+                    Main.Log($"[PreBuff] ★ Buff session completed: {_totalBuffsApplied} buffs applied");
                 }
                 return;
             }
@@ -293,7 +281,10 @@ namespace CompanionAI_Pathfinder.GameInterface
 
                 // 유효성 재확인
                 if (!IsValidRequest(request))
+                {
+                    _totalBuffsSkipped++;
                     continue;
+                }
 
                 // 시전자가 바쁜지 확인
                 if (!request.Caster.Commands.Empty)
@@ -307,6 +298,7 @@ namespace CompanionAI_Pathfinder.GameInterface
                 // 버프 시전
                 ExecuteBuff(request);
                 _lastBuffTime = Time.time;
+                _totalBuffsApplied++;
                 return;
             }
         }
@@ -320,12 +312,17 @@ namespace CompanionAI_Pathfinder.GameInterface
                 return false;
             if (request.Target == null || request.Target.HPLeft <= 0)
                 return false;
-            if (request.Buff?.Ability == null)
+            if (request.Ability == null)
                 return false;
-            if (!request.Buff.Ability.IsAvailableForCast)
+            if (!request.Ability.IsAvailableForCast)
                 return false;
-            if (AbilityClassifier.IsBuffAlreadyApplied(request.Buff.Ability, request.Target))
-                return false;
+
+            // 이미 적용된 버프 체크
+            if (request.Analysis?.AppliedBuff != null)
+            {
+                if (AbilityClassifier.IsBuffAlreadyApplied(request.Ability, request.Target))
+                    return false;
+            }
 
             return true;
         }
@@ -337,13 +334,18 @@ namespace CompanionAI_Pathfinder.GameInterface
         {
             try
             {
-                var ability = request.Buff.Ability;
+                var ability = request.Ability;
                 var target = new TargetWrapper(request.Target);
 
                 var command = new UnitUseAbility(ability, target);
                 request.Caster.Commands.Run(command);
 
-                Main.Log($"[PreBuff] {request.Caster.CharacterName} -> {request.Target.CharacterName}: {ability.Name}");
+                // 상세 로그
+                string priorityStr = request.Analysis?.Priority.ToString() ?? "?";
+                string valueStr = request.Analysis?.CombatValue.ToString("F2") ?? "?";
+
+                Main.Log($"[PreBuff] {request.Caster.CharacterName} -> {request.Target.CharacterName}: " +
+                         $"{ability.Name} [Priority={priorityStr}, Value={valueStr}]");
             }
             catch (Exception ex)
             {
@@ -384,7 +386,9 @@ namespace CompanionAI_Pathfinder.GameInterface
                     if (unit == null) continue;
                     if (!unit.IsPlayerFaction) continue;
                     if (unit.HPLeft <= 0) continue;
-                    // TODO: 펫/탈것 필터링 (나중에 구현)
+
+                    // 펫/소환수 필터링 (선택적)
+                    // if (unit.Master != null) continue;
 
                     result.Add(unit);
                 }
@@ -394,24 +398,6 @@ namespace CompanionAI_Pathfinder.GameInterface
                 Main.Error($"[PreBuff] GetPartyMembers error: {ex.Message}");
             }
             return result;
-        }
-
-        #endregion
-
-        #region Buff Request Structure
-
-        private struct BuffRequest
-        {
-            public UnitEntityData Caster;
-            public UnitEntityData Target;
-            public AbilityClassification Buff;
-
-            public BuffRequest(UnitEntityData caster, UnitEntityData target, AbilityClassification buff)
-            {
-                Caster = caster;
-                Target = target;
-                Buff = buff;
-            }
         }
 
         #endregion

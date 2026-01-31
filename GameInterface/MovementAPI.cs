@@ -1,4 +1,5 @@
 // ★ v0.2.30: MovementAPI - 이동 위치 평가 및 최적 위치 찾기 (Pathfinder WotR 버전)
+// ★ v0.2.65: LOS 체크 추가 - 좁은 지형에서 왔다갔다 현상 수정
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -157,10 +158,11 @@ namespace CompanionAI_Pathfinder.GameInterface
                 return score;
             }
 
-            // 2. 가장 가까운 적 거리 계산
+            // 2. 가장 가까운 적 거리 계산 + ★ v0.2.65: LOS 체크 추가
             float nearestEnemyDist = float.MaxValue;
             UnitEntityData nearestEnemy = null;
             int hittableCount = 0;
+            int losBlockedCount = 0;  // LOS 차단된 적 수
 
             foreach (var enemy in enemies)
             {
@@ -173,13 +175,35 @@ namespace CompanionAI_Pathfinder.GameInterface
                     nearestEnemy = enemy;
                 }
 
-                // 공격 범위 내 적 수
+                // ★ v0.2.65: 공격 범위 내 적 + LOS 체크
                 if (dist <= targetDistance)
-                    hittableCount++;
+                {
+                    // 원거리 공격 위치 평가 시 LOS 체크 (3m 초과 거리만)
+                    bool hasLos = true;
+                    if (goal == MovementGoal.RangedAttackPosition && dist > 3f)
+                    {
+                        hasLos = LineOfSightChecker.HasLineOfSightFromPosition(unit, position, enemy);
+                    }
+
+                    if (hasLos)
+                    {
+                        hittableCount++;
+                    }
+                    else
+                    {
+                        losBlockedCount++;
+                    }
+                }
             }
 
             score.HittableEnemyCount = hittableCount;
             score.HasLosToEnemy = hittableCount > 0;
+
+            // ★ v0.2.65: LOS 차단된 적만 있으면 페널티
+            if (losBlockedCount > 0 && hittableCount == 0)
+            {
+                score.LosScore = -20f;  // 모든 적이 LOS 차단됨
+            }
 
             // 3. 거리 기반 점수 (목표에 따라 다름)
             score.DistanceScore = CalculateDistanceScore(goal, nearestEnemyDist, targetDistance);
@@ -287,6 +311,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         /// <summary>
         /// 원거리 공격 최적 위치 찾기
+        /// ★ v0.2.65: LOS 체크 강화 - 공격 가능한 위치만 반환
         /// </summary>
         public static PositionScore FindRangedAttackPosition(
             UnitEntityData unit,
@@ -315,18 +340,53 @@ namespace CompanionAI_Pathfinder.GameInterface
             if (scores.Count == 0)
                 return null;
 
-            // 공격 가능한 위치 우선, 그 중 점수 높은 것
-            var best = scores
-                .OrderByDescending(s => s.HittableEnemyCount > 0 ? 1 : 0)
-                .ThenByDescending(s => s.TotalScore)
-                .FirstOrDefault();
+            // ★ v0.2.65: LOS가 확보된 위치만 필터링
+            var positionsWithLos = scores.Where(s => s.HittableEnemyCount > 0).ToList();
 
-            if (best != null)
+            if (positionsWithLos.Count > 0)
             {
-                Main.Verbose($"[MovementAPI] FindRangedAttackPosition: {best}");
+                // LOS 확보된 위치 중 최적 선택
+                var best = positionsWithLos.OrderByDescending(s => s.TotalScore).First();
+                Main.Verbose($"[MovementAPI] FindRangedAttackPosition (LOS OK): {best}");
+                return best;
             }
 
-            return best;
+            // ★ v0.2.65: LOS 확보된 위치가 없으면 더 넓은 범위 탐색
+            Main.Verbose($"[MovementAPI] No LOS position found in {SAMPLE_RADIUS}m, trying extended search");
+
+            // 확장 탐색: 적 방향으로 더 이동
+            var closestEnemy = enemies.OrderBy(e => Vector3.Distance(unit.Position, e.Position)).FirstOrDefault();
+            if (closestEnemy != null)
+            {
+                // 적 방향으로 이동하되, 적당한 거리 유지
+                Vector3 dirToEnemy = (closestEnemy.Position - unit.Position).normalized;
+                float currentDist = Vector3.Distance(unit.Position, closestEnemy.Position);
+
+                // 무기 사거리 - 2m 정도의 위치로 접근
+                float targetDist = Mathf.Max(weaponRange * 0.7f, RANGED_MIN_SAFE);
+                float moveDist = Mathf.Min(currentDist - targetDist, SAMPLE_RADIUS);
+
+                if (moveDist > 2f)
+                {
+                    Vector3 approachPos = unit.Position + dirToEnemy * moveDist;
+                    var approachScore = EvaluatePosition(
+                        unit, approachPos, enemies,
+                        MovementGoal.RangedAttackPosition,
+                        weaponRange,
+                        influenceMap);
+
+                    if (approachScore.IsWalkable && approachScore.HittableEnemyCount > 0)
+                    {
+                        Main.Verbose($"[MovementAPI] Found approach position with LOS: {approachScore}");
+                        return approachScore;
+                    }
+                }
+            }
+
+            // 폴백: LOS 없는 위치도 없으면 null 반환 (이동 안 함)
+            // 이전 동작: LOS 없어도 거리 기반으로 이동 → 왔다갔다 현상 발생
+            Main.Log($"[MovementAPI] No valid ranged position with LOS found - staying put to avoid oscillation");
+            return null;
         }
 
         /// <summary>

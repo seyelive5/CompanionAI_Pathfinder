@@ -18,11 +18,15 @@ namespace CompanionAI_Pathfinder.Scoring
         /// <summary>
         /// HP 긴급도 (힐링 우선순위용)
         /// 낮을수록 긴급 = 높은 점수
+        /// ★ v0.2.70: HP >= 100%일 때 0.0 반환 (힐 완전 불필요)
         /// </summary>
-        /// <param name="hpPercent">HP 퍼센트 (0-100)</param>
-        /// <returns>0.0 (풀피) ~ 1.0 (위험)</returns>
+        /// <param name="hpPercent">HP 퍼센트 (0-100+)</param>
+        /// <returns>0.0 (풀피/오버힐) ~ 1.0 (위험)</returns>
         public static float HPUrgency(float hpPercent)
         {
+            // ★ v0.2.70: HP >= 100%면 힐 완전 불필요
+            if (hpPercent >= 100f)
+                return 0.0f;      // Full/Temp HP - 힐 불필요
             if (hpPercent < 25f)
                 return 1.0f;      // Critical - 최우선
             if (hpPercent < 50f)
@@ -31,7 +35,7 @@ namespace CompanionAI_Pathfinder.Scoring
                 return 0.4f;      // Moderate - 보통
             if (hpPercent < 90f)
                 return 0.2f;      // Healthy - 낮은 우선순위
-            return 0.1f;          // Full - 힐 불필요
+            return 0.1f;          // Near full - 힐 거의 불필요
         }
 
         /// <summary>

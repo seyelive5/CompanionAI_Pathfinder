@@ -1,5 +1,6 @@
 // ★ v0.2.30: MovementPlanner - 이동 계획 오케스트레이터 (Pathfinder WotR 버전)
 // RT 모드 v3.5.7에서 포팅 - 전술 시스템 통합
+// ★ v0.2.65: 이동 루프 방지 메커니즘 추가
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -18,9 +19,95 @@ namespace CompanionAI_Pathfinder.Planning
     /// ★ v0.2.30: 이동 관련 계획 담당
     /// - 이동, 후퇴, 안전 이동 결정
     /// - MovementAPI, TeamBlackboard, InfluenceMap 통합
+    /// ★ v0.2.65: 이동 루프 방지 메커니즘 추가
     /// </summary>
     public static class MovementPlanner
     {
+        #region Oscillation Prevention (v0.2.65)
+
+        /// <summary>
+        /// ★ v0.2.65: 유닛별 최근 이동 위치 기록 (루프 감지용)
+        /// Key: unitId, Value: (positions, lastUpdateTime)
+        /// </summary>
+        private static readonly Dictionary<string, (List<Vector3> positions, float lastTime)> _moveHistory
+            = new Dictionary<string, (List<Vector3>, float)>();
+
+        private const int MAX_HISTORY = 5;  // 최대 기록 수
+        private const float HISTORY_TIMEOUT = 10f;  // 기록 만료 시간 (초)
+        private const float OSCILLATION_THRESHOLD = 4f;  // 같은 위치로 간주하는 거리
+
+        /// <summary>
+        /// ★ v0.2.65: 이동 진동 감지
+        /// 최근 이동 기록에서 비슷한 위치를 왔다갔다 하는지 확인
+        /// </summary>
+        private static bool IsOscillating(string unitId, Vector3 newPosition)
+        {
+            if (string.IsNullOrEmpty(unitId))
+                return false;
+
+            if (!_moveHistory.TryGetValue(unitId, out var history))
+                return false;
+
+            // 오래된 기록 무시
+            if (Time.time - history.lastTime > HISTORY_TIMEOUT)
+            {
+                _moveHistory.Remove(unitId);
+                return false;
+            }
+
+            // 최근 이동 기록 중 비슷한 위치가 2회 이상 있으면 진동으로 판단
+            int similarCount = 0;
+            foreach (var pos in history.positions)
+            {
+                if (Vector3.Distance(pos, newPosition) < OSCILLATION_THRESHOLD)
+                {
+                    similarCount++;
+                    if (similarCount >= 2)
+                    {
+                        Main.Log($"[MovementPlanner] ★ Oscillation detected for {unitId} - blocking repeated movement");
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// ★ v0.2.65: 이동 위치 기록
+        /// </summary>
+        private static void RecordMovement(string unitId, Vector3 position)
+        {
+            if (string.IsNullOrEmpty(unitId))
+                return;
+
+            if (!_moveHistory.TryGetValue(unitId, out var history))
+            {
+                history = (new List<Vector3>(), Time.time);
+            }
+
+            history.positions.Add(position);
+            history.lastTime = Time.time;
+
+            // 최대 기록 수 유지
+            while (history.positions.Count > MAX_HISTORY)
+            {
+                history.positions.RemoveAt(0);
+            }
+
+            _moveHistory[unitId] = history;
+        }
+
+        /// <summary>
+        /// ★ v0.2.65: 이동 기록 초기화 (전투 종료 시 호출)
+        /// </summary>
+        public static void ClearMoveHistory()
+        {
+            _moveHistory.Clear();
+        }
+
+        #endregion
+
         #region Main Entry Points
 
         /// <summary>
@@ -254,11 +341,13 @@ namespace CompanionAI_Pathfinder.Planning
 
         /// <summary>
         /// 원거리 공격 위치 계획
+        /// ★ v0.2.65: 이동 루프 감지 추가
         /// </summary>
         private static MoveDecision PlanRangedPosition(Situation situation, UnitEntityData target, string roleName)
         {
             var unit = situation.Unit;
             float weaponRange = situation.WeaponRange;
+            string unitId = unit?.UniqueId;
 
             // MovementAPI로 최적 원거리 위치 찾기
             var bestPosition = MovementAPI.FindRangedAttackPosition(
@@ -270,12 +359,21 @@ namespace CompanionAI_Pathfinder.Planning
 
             if (bestPosition == null)
             {
-                // 폴백: 적에게 접근
+                // ★ v0.2.65: LOS 확보된 위치가 없으면 접근 시도
+                // 단, 진동 감지 시 이동 중단
                 var approachPosition = MovementAPI.FindApproachPosition(
                     unit, target, situation.Enemies, situation.InfluenceMap);
 
                 if (approachPosition != null)
                 {
+                    // ★ v0.2.65: 진동 감지
+                    if (IsOscillating(unitId, approachPosition.Position))
+                    {
+                        Main.Log($"[{roleName}] Movement blocked - oscillation detected, waiting for better opportunity");
+                        return null;
+                    }
+
+                    RecordMovement(unitId, approachPosition.Position);
                     Main.Log($"[{roleName}] No attack position, approach to ({approachPosition.Position.x:F1},{approachPosition.Position.z:F1})");
                     return new MoveDecision
                     {
@@ -296,6 +394,15 @@ namespace CompanionAI_Pathfinder.Planning
                 Main.Verbose($"[{roleName}] Already at optimal position");
                 return null;
             }
+
+            // ★ v0.2.65: 진동 감지
+            if (IsOscillating(unitId, bestPosition.Position))
+            {
+                Main.Log($"[{roleName}] Movement blocked - oscillation detected");
+                return null;
+            }
+
+            RecordMovement(unitId, bestPosition.Position);
 
             Main.Log($"[{roleName}] Ranged position: ({bestPosition.Position.x:F1},{bestPosition.Position.z:F1}) " +
                 $"Score={bestPosition.TotalScore:F1}, Hittable={bestPosition.HittableEnemyCount}");

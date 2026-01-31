@@ -442,19 +442,8 @@ namespace CompanionAI_Pathfinder.Analysis
             return ScoreEnemyUnified(situation.Unit, target, ToAIRole(rangePreference), situation);
         }
 
-        /// <summary>
-        /// Role별 가중치 반환
-        /// </summary>
-        private static EnemyWeights GetEnemyWeights(RangePreference preference)
-        {
-            switch (preference)
-            {
-                case RangePreference.Melee: return TankWeights;
-                case RangePreference.Ranged: return SupportWeights;
-                case RangePreference.Mixed:
-                default: return DPSWeights;
-            }
-        }
+        // ★ v0.2.69: GetEnemyWeights(RangePreference) 삭제됨
+        // → GetWeightsForRole(AIRole) 사용
 
         /// <summary>
         /// Role 기반 최적 적 타겟 선택

@@ -1587,6 +1587,7 @@ namespace CompanionAI_Pathfinder.GameInterface
         /// <summary>
         /// Clear cache
         /// ★ v0.2.32: 위상 오프셋, 대기열, CombatDataCache도 초기화
+        /// ★ v0.2.65: MovementPlanner 이동 기록 초기화 추가
         /// </summary>
         public void ClearCache()
         {
@@ -1602,6 +1603,9 @@ namespace CompanionAI_Pathfinder.GameInterface
 
             // ★ v0.2.30: TeamBlackboard도 초기화
             TeamBlackboard.Instance.Clear();
+
+            // ★ v0.2.65: 이동 루프 감지 기록 초기화
+            Planning.MovementPlanner.ClearMoveHistory();
         }
 
         /// <summary>
@@ -1645,6 +1649,7 @@ namespace CompanionAI_Pathfinder.GameInterface
                         if (!anyInCombat)
                         {
                             TeamBlackboard.Instance.Clear();
+                            Planning.MovementPlanner.ClearMoveHistory();  // ★ v0.2.65
                             Main.Log("[RT] TeamBlackboard cleared (combat ended)");
                         }
                     }

@@ -2,6 +2,7 @@
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
 // ★ v0.2.41: Charge ability distance penalty
 // ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
+// ★ v0.2.66: AoO 페널티 통합 - CombatRulesAnalyzer 사용
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -210,6 +211,81 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 {
                     // 충분히 멀다 - 돌격 보너스
                     cs.Add("ChargeDistance", 1.0f);
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // ★ v0.2.66: AoO (Attack of Opportunity) 페널티
+            // 위협 범위 내에서 주문/원거리 공격 시 기회공격 유발
+            // ═══════════════════════════════════════════════════════════════
+            if (candidate.Ability != null)
+            {
+                var aoOAnalysis = CombatRulesAnalyzer.AnalyzeAbility(situation.Unit, candidate.Ability);
+
+                if (aoOAnalysis.ProvokesAoO && !aoOAnalysis.HasAoOImmunity)
+                {
+                    // 방어적 시전 성공률 기반 점수 (0.0 ~ 1.0)
+                    float safetyScore = aoOAnalysis.DefensiveCastingSuccessChance;
+
+                    // 페널티 점수를 Consideration으로 변환
+                    // 성공률 95%+ = 0.95, 50% = 0.5, 0% = 0.1 (완전 Veto는 안함)
+                    float aoOScore = Mathf.Max(0.1f, safetyScore);
+                    cs.Add("AoORisk", aoOScore);
+
+                    // BonusScore에 페널티 반영 (심각한 경우 큰 페널티)
+                    if (aoOAnalysis.Recommendation == AbilityRecommendation.Avoid)
+                    {
+                        candidate.BonusScore += aoOAnalysis.PenaltyScore;  // -50 정도
+                    }
+                    else if (aoOAnalysis.Recommendation == AbilityRecommendation.Dangerous)
+                    {
+                        candidate.BonusScore += aoOAnalysis.PenaltyScore;  // -30 정도
+                    }
+
+                    Main.Verbose($"[AttackScorer] AoO risk: {candidate.Ability.Name} - Success={safetyScore:P0}, Rec={aoOAnalysis.Recommendation}");
+                }
+                else
+                {
+                    // AoO 위험 없음
+                    cs.Add("AoORisk", 1.0f);
+                }
+
+                // ═══════════════════════════════════════════════════════════════
+                // ★ v0.2.67: 저항/면역 체크 (SR, Energy Immunity, Condition Immunity)
+                // 타겟이 이 능력에 면역이거나 높은 SR을 가지면 페널티
+                // ═══════════════════════════════════════════════════════════════
+                if (candidate.Target != null)
+                {
+                    var resistAnalysis = CombatRulesAnalyzer.AnalyzeResistance(
+                        situation.Unit, candidate.Target, candidate.Ability);
+
+                    if (resistAnalysis.IsCompletelyIneffective)
+                    {
+                        // 완전 면역 - 이 능력을 이 타겟에 사용하지 않음
+                        cs.Add("ResistImmunity", 0.01f);  // 거의 0에 가까운 점수
+                        candidate.BonusScore += -100f;  // 강력한 페널티
+
+                        Main.Verbose($"[AttackScorer] IMMUNE: {candidate.Ability.Name} vs {candidate.Target.CharacterName} " +
+                            $"- Reasons: {string.Join(", ", resistAnalysis.ImmunityReasons)}");
+                    }
+                    else if (resistAnalysis.HasSpellResistance || resistAnalysis.ImmunityChance > 0f)
+                    {
+                        // SR 또는 부분 면역
+                        float effectivenessScore = Mathf.Max(0.1f, resistAnalysis.SRPenetrationChance * (1f - resistAnalysis.ImmunityChance));
+                        cs.Add("ResistImmunity", effectivenessScore);
+
+                        // 페널티 적용
+                        candidate.BonusScore += resistAnalysis.PenaltyScore;
+
+                        Main.Verbose($"[AttackScorer] Resistance: {candidate.Ability.Name} vs {candidate.Target.CharacterName} " +
+                            $"- SR={resistAnalysis.SpellResistance}, Penetration={resistAnalysis.SRPenetrationChance:P0}, " +
+                            $"Penalty={resistAnalysis.PenaltyScore:F0}");
+                    }
+                    else
+                    {
+                        // 저항/면역 없음
+                        cs.Add("ResistImmunity", 1.0f);
+                    }
                 }
             }
 

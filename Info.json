@@ -2,7 +2,7 @@
   "Id": "CompanionAI_Pathfinder",
   "DisplayName": "CompanionAI - Tactical AI for Companions",
   "Author": "veria",
-  "Version": "0.2.62",
+  "Version": "0.2.71",
   "ManagerVersion": "0.27.0",
   "Requirements": [],
   "AssemblyName": "CompanionAI_Pathfinder.dll",

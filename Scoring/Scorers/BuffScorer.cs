@@ -4,10 +4,12 @@
 // ★ v0.2.39: 버프 전투 가치 분석 (CombatValue Consideration)
 // ★ v0.2.40: 인챈트 주문 지원 및 IsAlreadyApplied 버그 수정
 // ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
+// ★ v0.2.64: BuffStackingAnalyzer 통합 - ModifierDescriptor 기반 충돌 감지
 using System;
 using System.Linq;
 using Kingmaker.EntitySystem.Entities;
 using Kingmaker.UnitLogic.Abilities;
+using Kingmaker.UnitLogic.Buffs.Blueprints;
 using UnityEngine;
 using CompanionAI_Pathfinder.Analysis;
 using CompanionAI_Pathfinder.Settings;
@@ -64,6 +66,13 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
                 // ★ v0.2.37: Consideration 기반 점수 구축
                 BuildHealConsiderations(candidate, situation, target, analysis, isSelf, weights);
+
+                // ★ v0.2.70: Veto된 경우 즉시 반환
+                if (candidate.Considerations.HasVeto)
+                {
+                    candidate.BaseScore = -1000f;
+                    return;
+                }
 
                 // ═══════════════════════════════════════════════════════════════
                 // 1. ★ v0.2.36: Use enhanced TargetScorer for ally scoring
@@ -206,6 +215,21 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 // ★ v0.2.52: TargetAnalyzer 통합 사용
                 var analysis = TargetAnalyzer.Analyze(target, situation.Unit);
 
+                // ★ v0.2.71: 버프 효과 충돌 체크를 먼저 수행 (Veto 처리)
+                var buffEffects = AbilityClassifier.GetBuffEffects(candidate.Ability);
+                if (buffEffects?.PrimaryBuff != null)
+                {
+                    if (!WouldBuffBeEffective(target, buffEffects.PrimaryBuff))
+                    {
+                        // 효과가 없는 버프는 Veto
+                        candidate.Considerations.Clear();
+                        candidate.Considerations.AddVeto("BuffEffective", false);
+                        candidate.BaseScore = -1000f;
+                        Main.Verbose($"[BuffScorer] Buff vetoed: {candidate.Ability?.Name} ineffective on {target.CharacterName}");
+                        return;
+                    }
+                }
+
                 // ★ v0.2.37: Consideration 기반 점수 구축
                 BuildBuffConsiderations(candidate, situation, target, analysis, isSelf, weights);
 
@@ -236,6 +260,7 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 }
 
                 // 3. Timing classification from AbilityClassifier
+                // ★ v0.2.69: 중복 체크 제거 - BuildBuffConsiderations에서 이미 Veto 처리됨
                 if (candidate.Classification != null)
                 {
                     var timing = candidate.Classification.Timing;
@@ -243,11 +268,9 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                     switch (timing)
                     {
                         case AbilityTiming.PermanentBuff:
-                            // Permanent buffs are always good if not applied
-                            if (!IsBuffAlreadyApplied(candidate.Ability, target))
-                                score += 25f;
-                            else
-                                score -= 100f;  // Already applied
+                            // Permanent buffs: 이미 적용됨 체크는 Consideration에서 처리
+                            // 여기서는 보너스만 부여
+                            score += 25f;
                             break;
 
                         case AbilityTiming.PreCombatBuff:
@@ -347,6 +370,14 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             cs.Clear();
 
             float targetHP = analysis?.HPPercent ?? 100f;
+
+            // ★ v0.2.70: HP >= 100% (임시 HP 포함)이면 힐 완전 불필요 - Veto
+            if (targetHP >= 100f)
+            {
+                cs.AddVeto("NotOverhealing", false);
+                Main.Verbose($"[BuffScorer] Heal vetoed: {target.CharacterName} HP={targetHP:F0}% (no healing needed)");
+                return;
+            }
 
             // ═══════════════════════════════════════════════════════════════
             // 1. ★ v0.2.52: 힐 필요도 (TargetNormalizer 사용)
@@ -592,6 +623,25 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             catch
             {
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.64: 버프가 대상에게 효과가 있는지 확인
+        /// - BuffStackingAnalyzer를 사용하여 ModifierDescriptor 기반 분석
+        /// </summary>
+        private bool WouldBuffBeEffective(UnitEntityData target, BlueprintBuff buff)
+        {
+            if (target == null || buff == null)
+                return true;
+
+            try
+            {
+                return BuffStackingAnalyzer.WouldBeEffective(buff, target);
+            }
+            catch
+            {
+                return true;
             }
         }
 
