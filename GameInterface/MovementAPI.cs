@@ -1,9 +1,11 @@
 // ★ v0.2.30: MovementAPI - 이동 위치 평가 및 최적 위치 찾기 (Pathfinder WotR 버전)
 // ★ v0.2.65: LOS 체크 추가 - 좁은 지형에서 왔다갔다 현상 수정
+// ★ v0.2.98: 동적 이동 반경 계산 - 실제 유닛 이동 속도 기반
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using Kingmaker.EntitySystem.Entities;
+using TurnBased.Controllers;
 using UnityEngine;
 using CompanionAI_Pathfinder.Analysis;
 using CompanionAI_Pathfinder.Settings;
@@ -13,18 +15,117 @@ namespace CompanionAI_Pathfinder.GameInterface
     /// <summary>
     /// 이동 API - 위치 평가 및 최적 위치 찾기
     /// Pathfinder WotR 호환 간소화 버전
+    /// ★ v0.2.98: 동적 이동 반경 - 하드코딩된 상수 대신 실제 유닛 속도 사용
     /// </summary>
     public static class MovementAPI
     {
         #region Constants
 
-        private const float SAMPLE_RADIUS = 12f;      // 위치 샘플링 최대 반경 (★ v0.2.31: 15→12 축소)
-        private const int SAMPLES_PER_RING = 6;       // 각 링당 샘플 수 (★ v0.2.31: 8→6 축소)
-        private const int NUM_RINGS = 3;              // 링 수 (★ v0.2.31: 5→3 축소)
-        private const float MIN_MELEE_RANGE = 1.5f;   // 근접 최소 거리
-        private const float MAX_MELEE_RANGE = 3f;     // 근접 최대 거리
-        private const float RANGED_MIN_SAFE = 6f;     // 원거리 최소 안전 거리
-        private const float RANGED_OPTIMAL = 10f;     // 원거리 최적 거리
+        // ★ v0.2.98: SAMPLE_RADIUS는 이제 폴백용으로만 사용
+        private const float DEFAULT_SAMPLE_RADIUS = 12f;  // 폴백 반경 (속도 계산 실패 시)
+        private const int SAMPLES_PER_RING = 6;           // 각 링당 샘플 수
+        private const int NUM_RINGS = 3;                  // 링 수
+        private const float MIN_MELEE_RANGE = 1.5f;       // 근접 최소 거리
+        private const float MAX_MELEE_RANGE = 3f;         // 근접 최대 거리
+        private const float RANGED_MIN_SAFE = 6f;         // 원거리 최소 안전 거리
+        private const float RANGED_OPTIMAL = 10f;         // 원거리 최적 거리
+
+        #endregion
+
+        #region ★ v0.2.98: Dynamic Movement Calculation
+
+        /// <summary>
+        /// ★ v0.2.98: 유닛의 실제 이동 가능 거리 계산
+        /// 턴제: 1 Move Action = 속도 * 3초
+        /// 실시간: 속도 * 2초 (약간의 여유)
+        /// </summary>
+        public static float GetMaxMoveDistance(UnitEntityData unit)
+        {
+            if (unit == null)
+                return DEFAULT_SAMPLE_RADIUS;
+
+            try
+            {
+                // 기본 이동 속도 (미터/초)
+                float speedMps = unit.CurrentSpeedMps;
+                if (speedMps <= 0)
+                {
+                    // 폴백: ModifiedValue 사용
+                    speedMps = unit.Stats?.Speed?.ModifiedValue ?? 30f;
+                    speedMps = speedMps / 5f;  // feet/round → m/s 대략 변환
+                }
+
+                bool isTurnBased = CombatController.IsInTurnBasedCombat();
+
+                float maxDistance;
+                if (isTurnBased)
+                {
+                    // ★ 턴제: 1 Move Action = 속도 * 3초
+                    // Pathfinder에서 1 라운드 = 6초, Move Action = 라운드의 절반
+                    maxDistance = speedMps * 3f;
+                }
+                else
+                {
+                    // ★ 실시간: 쿨다운 기반으로 약 2초 분량
+                    maxDistance = speedMps * 2f;
+                }
+
+                // 최소/최대 제한
+                maxDistance = Mathf.Clamp(maxDistance, 3f, 20f);
+
+                Main.Verbose($"[MovementAPI] GetMaxMoveDistance: {unit.CharacterName} speed={speedMps:F1}m/s, " +
+                           $"mode={(isTurnBased ? "TB" : "RT")}, maxDist={maxDistance:F1}m");
+
+                return maxDistance;
+            }
+            catch (Exception ex)
+            {
+                Main.Verbose($"[MovementAPI] GetMaxMoveDistance error: {ex.Message}");
+                return DEFAULT_SAMPLE_RADIUS;
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.98: 유닛의 근접 공격 도달 범위 계산
+        /// Corpulence(몸 크기) + 무기 Reach 포함
+        /// </summary>
+        public static float GetMeleeReachDistance(UnitEntityData unit)
+        {
+            if (unit == null)
+                return MAX_MELEE_RANGE;
+
+            try
+            {
+                // 무기의 AttackRange 사용 (게임 API)
+                var weapon = unit.Body?.PrimaryHand?.MaybeWeapon;
+                if (weapon != null)
+                {
+                    var attackRange = weapon.AttackRange;
+                    if (attackRange.Meters > 0)
+                    {
+                        // Corpulence(몸 크기) 보너스 추가
+                        float corpulence = unit.Corpulence;
+                        return attackRange.Meters + corpulence + 0.5f;  // 여유
+                    }
+                }
+
+                // 폴백: Descriptor에서 Reach 계산
+                if (unit.Descriptor != null)
+                {
+                    var reachRange = unit.Descriptor.GetWeaponRange(null);
+                    if (reachRange.Meters > 0)
+                    {
+                        return reachRange.Meters + unit.Corpulence + 0.5f;
+                    }
+                }
+
+                return MAX_MELEE_RANGE;
+            }
+            catch
+            {
+                return MAX_MELEE_RANGE;
+            }
+        }
 
         #endregion
 
@@ -71,6 +172,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         /// <summary>
         /// 유닛 주변의 후보 위치 생성
+        /// ★ v0.2.98: maxRadius 파라미터로 동적 반경 지원
         /// </summary>
         private static List<Vector3> GenerateCandidatePositions(Vector3 center, float maxRadius)
         {
@@ -79,10 +181,17 @@ namespace CompanionAI_Pathfinder.GameInterface
             // 현재 위치도 후보에 포함
             positions.Add(center);
 
+            // ★ v0.2.98: maxRadius가 너무 작으면 링 수 조절
+            int rings = NUM_RINGS;
+            if (maxRadius < 6f)
+                rings = 2;
+            if (maxRadius < 3f)
+                rings = 1;
+
             // 동심원 형태로 위치 샘플링
-            for (int ring = 1; ring <= NUM_RINGS; ring++)
+            for (int ring = 1; ring <= rings; ring++)
             {
-                float radius = (maxRadius / NUM_RINGS) * ring;
+                float radius = (maxRadius / rings) * ring;
                 int samples = SAMPLES_PER_RING;
 
                 for (int i = 0; i < samples; i++)
@@ -100,15 +209,20 @@ namespace CompanionAI_Pathfinder.GameInterface
                 }
             }
 
+            Main.Verbose($"[MovementAPI] GenerateCandidatePositions: radius={maxRadius:F1}m, rings={rings}, total={positions.Count}");
             return positions;
         }
 
         /// <summary>
         /// 적 주변의 공격 위치 생성 (근접용)
+        /// ★ v0.2.98: meleeReach 파라미터로 동적 거리 지원
         /// </summary>
-        private static List<Vector3> GenerateMeleePositions(UnitEntityData enemy)
+        private static List<Vector3> GenerateMeleePositions(UnitEntityData enemy, float meleeReach = 2f)
         {
             var positions = new List<Vector3>();
+
+            // 적의 크기 고려
+            float enemySize = enemy?.Corpulence ?? 0.5f;
 
             // 적 주변 8방향
             for (int i = 0; i < 8; i++)
@@ -116,8 +230,8 @@ namespace CompanionAI_Pathfinder.GameInterface
                 float angle = (360f / 8) * i;
                 float rad = angle * Mathf.Deg2Rad;
 
-                // 근접 거리에 위치
-                float dist = MIN_MELEE_RANGE + 0.5f;
+                // ★ v0.2.98: 근접 도달 범위에서 약간 안쪽 위치 (확실히 공격 가능하도록)
+                float dist = Mathf.Max(1.5f, meleeReach * 0.8f + enemySize);
                 Vector3 offset = new Vector3(
                     Mathf.Cos(rad) * dist,
                     0,
@@ -312,6 +426,7 @@ namespace CompanionAI_Pathfinder.GameInterface
         /// <summary>
         /// 원거리 공격 최적 위치 찾기
         /// ★ v0.2.65: LOS 체크 강화 - 공격 가능한 위치만 반환
+        /// ★ v0.2.98: 동적 이동 반경 사용 - 실제 이동 가능 거리 기반
         /// </summary>
         public static PositionScore FindRangedAttackPosition(
             UnitEntityData unit,
@@ -322,7 +437,9 @@ namespace CompanionAI_Pathfinder.GameInterface
             if (unit == null || enemies == null || enemies.Count == 0)
                 return null;
 
-            var candidates = GenerateCandidatePositions(unit.Position, SAMPLE_RADIUS);
+            // ★ v0.2.98: 실제 이동 가능 거리 계산
+            float maxMoveDistance = GetMaxMoveDistance(unit);
+            var candidates = GenerateCandidatePositions(unit.Position, maxMoveDistance);
             var scores = new List<PositionScore>();
 
             foreach (var pos in candidates)
@@ -352,7 +469,8 @@ namespace CompanionAI_Pathfinder.GameInterface
             }
 
             // ★ v0.2.65: LOS 확보된 위치가 없으면 더 넓은 범위 탐색
-            Main.Verbose($"[MovementAPI] No LOS position found in {SAMPLE_RADIUS}m, trying extended search");
+            // ★ v0.2.98: 실제 이동 가능 거리 사용
+            Main.Verbose($"[MovementAPI] No LOS position found in {maxMoveDistance:F1}m, trying extended search");
 
             // 확장 탐색: 적 방향으로 더 이동
             var closestEnemy = enemies.OrderBy(e => Vector3.Distance(unit.Position, e.Position)).FirstOrDefault();
@@ -364,7 +482,8 @@ namespace CompanionAI_Pathfinder.GameInterface
 
                 // 무기 사거리 - 2m 정도의 위치로 접근
                 float targetDist = Mathf.Max(weaponRange * 0.7f, RANGED_MIN_SAFE);
-                float moveDist = Mathf.Min(currentDist - targetDist, SAMPLE_RADIUS);
+                // ★ v0.2.98: 실제 이동 가능 거리 제한
+                float moveDist = Mathf.Min(currentDist - targetDist, maxMoveDistance);
 
                 if (moveDist > 2f)
                 {
@@ -391,6 +510,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         /// <summary>
         /// 근접 공격 최적 위치 찾기
+        /// ★ v0.2.98: 동적 근접 도달 범위 사용
         /// </summary>
         public static PositionScore FindMeleeAttackPosition(
             UnitEntityData unit,
@@ -401,7 +521,9 @@ namespace CompanionAI_Pathfinder.GameInterface
             if (unit == null || target == null)
                 return null;
 
-            var candidates = GenerateMeleePositions(target);
+            // ★ v0.2.98: 실제 근접 도달 범위 계산
+            float meleeReach = GetMeleeReachDistance(unit);
+            var candidates = GenerateMeleePositions(target, meleeReach);
             var scores = new List<PositionScore>();
 
             foreach (var pos in candidates)
@@ -409,7 +531,7 @@ namespace CompanionAI_Pathfinder.GameInterface
                 var score = EvaluatePosition(
                     unit, pos, enemies,
                     MovementGoal.MeleeAttackPosition,
-                    MAX_MELEE_RANGE,
+                    meleeReach,
                     influenceMap);
 
                 if (score.IsWalkable)
@@ -418,8 +540,8 @@ namespace CompanionAI_Pathfinder.GameInterface
 
             if (scores.Count == 0)
             {
-                // 폴백: 적에게 직접 접근
-                var approachPos = target.Position + (unit.Position - target.Position).normalized * MIN_MELEE_RANGE;
+                // ★ v0.2.98: 폴백 - 실제 근접 도달 범위 사용
+                var approachPos = target.Position + (unit.Position - target.Position).normalized * (meleeReach * 0.8f);
                 return new PositionScore
                 {
                     Position = approachPos,
@@ -440,6 +562,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         /// <summary>
         /// 후퇴 위치 찾기
+        /// ★ v0.2.98: 동적 이동 반경 사용
         /// </summary>
         public static PositionScore FindRetreatPosition(
             UnitEntityData unit,
@@ -450,7 +573,9 @@ namespace CompanionAI_Pathfinder.GameInterface
             if (unit == null || enemies == null || enemies.Count == 0)
                 return null;
 
-            var candidates = GenerateCandidatePositions(unit.Position, SAMPLE_RADIUS);
+            // ★ v0.2.98: 실제 이동 가능 거리 계산
+            float maxMoveDistance = GetMaxMoveDistance(unit);
+            var candidates = GenerateCandidatePositions(unit.Position, maxMoveDistance);
             var scores = new List<PositionScore>();
 
             foreach (var pos in candidates)
@@ -483,6 +608,7 @@ namespace CompanionAI_Pathfinder.GameInterface
 
         /// <summary>
         /// 적에게 접근하는 최적 위치 찾기
+        /// ★ v0.2.98: 동적 이동 거리 사용 - 실제 유닛 속도 기반
         /// </summary>
         public static PositionScore FindApproachPosition(
             UnitEntityData unit,
@@ -497,8 +623,10 @@ namespace CompanionAI_Pathfinder.GameInterface
             Vector3 direction = (target.Position - unit.Position).normalized;
             float currentDist = Vector3.Distance(unit.Position, target.Position);
 
-            // 이동 가능한 최대 거리 (약 6m)
-            float moveDistance = Mathf.Min(6f, currentDist - MIN_MELEE_RANGE);
+            // ★ v0.2.98: 실제 이동 가능 거리 계산
+            float maxMoveDistance = GetMaxMoveDistance(unit);
+            float meleeReach = GetMeleeReachDistance(unit);
+            float moveDistance = Mathf.Min(maxMoveDistance, currentDist - meleeReach);
 
             if (moveDistance <= 0)
             {

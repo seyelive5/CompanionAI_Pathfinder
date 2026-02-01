@@ -1,5 +1,7 @@
 using System.Collections.Generic;
+using Kingmaker;
 using Kingmaker.EntitySystem.Entities;
+using TurnBased.Controllers;
 
 namespace CompanionAI_Pathfinder.Core
 {
@@ -31,7 +33,7 @@ namespace CompanionAI_Pathfinder.Core
         public int TurnStartFrame { get; }
 
         /// <summary>이 턴이 시작된 전투 라운드</summary>
-        public int CombatRound { get; }
+        public int CombatRound { get; private set; }
 
         #endregion
 
@@ -109,6 +111,112 @@ namespace CompanionAI_Pathfinder.Core
 
         #endregion
 
+        #region ★ v0.2.108: Command Execution Tracking
+
+        /// <summary>
+        /// 명령 실행 대기 중 여부
+        /// ProcessTurn에서 명령을 내린 후 true로 설정,
+        /// 명령 완료 시 false로 설정
+        /// </summary>
+        public bool IsAwaitingCommandCompletion { get; set; }
+
+        /// <summary>명령 대기 시작 프레임</summary>
+        public int CommandWaitStartFrame { get; set; }
+
+        /// <summary>명령 대기 최대 프레임 수 (무한 대기 방지)</summary>
+        private const int MaxCommandWaitFrames = 300;  // 약 5초
+
+        /// <summary>명령 대기 시간 초과 여부</summary>
+        public bool IsCommandWaitTimeout =>
+            IsAwaitingCommandCompletion &&
+            (UnityEngine.Time.frameCount - CommandWaitStartFrame) > MaxCommandWaitFrames;
+
+        /// <summary>명령 실행 시작 기록</summary>
+        public void StartAwaitingCommand()
+        {
+            IsAwaitingCommandCompletion = true;
+            CommandWaitStartFrame = UnityEngine.Time.frameCount;
+        }
+
+        /// <summary>명령 완료 기록</summary>
+        public void FinishAwaitingCommand()
+        {
+            IsAwaitingCommandCompletion = false;
+        }
+
+        #endregion
+
+        #region ★ v0.2.99: Failed Ability Tracking
+
+        /// <summary>이번 턴에 실패한 능력 GUID 목록 (무한 재시도 방지)</summary>
+        private HashSet<string> _failedAbilities = new HashSet<string>();
+
+        /// <summary>마지막으로 선택된 능력 GUID (연속 선택 감지용)</summary>
+        public string LastSelectedAbilityGuid { get; private set; }
+
+        /// <summary>마지막 능력 연속 선택 횟수</summary>
+        public int ConsecutiveAbilitySelectionCount { get; private set; }
+
+        /// <summary>이번 턴에 실패한 능력인지 확인</summary>
+        public bool IsAbilityFailed(string abilityGuid)
+        {
+            if (string.IsNullOrEmpty(abilityGuid)) return false;
+            return _failedAbilities.Contains(abilityGuid);
+        }
+
+        /// <summary>능력 실패 기록 (이번 턴에 다시 시도하지 않음)</summary>
+        public void RecordAbilityFailure(string abilityGuid, string reason = null)
+        {
+            if (string.IsNullOrEmpty(abilityGuid)) return;
+            _failedAbilities.Add(abilityGuid);
+            Main.Log($"[TurnState] ★ Ability marked as failed: {abilityGuid} ({reason ?? "unknown reason"})");
+        }
+
+        /// <summary>실패한 능력 수</summary>
+        public int FailedAbilityCount => _failedAbilities.Count;
+
+        /// <summary>
+        /// 능력 선택 기록 (연속 선택 감지용)
+        /// 같은 능력이 연속 3회 이상 선택되고 진행 안 되면 실패로 간주
+        /// </summary>
+        public bool RecordAbilitySelection(string abilityGuid)
+        {
+            if (string.IsNullOrEmpty(abilityGuid))
+            {
+                LastSelectedAbilityGuid = null;
+                ConsecutiveAbilitySelectionCount = 0;
+                return false;
+            }
+
+            if (LastSelectedAbilityGuid == abilityGuid)
+            {
+                ConsecutiveAbilitySelectionCount++;
+
+                // 3회 연속 같은 능력 선택 = 진행 안 됨 → 실패로 기록
+                if (ConsecutiveAbilitySelectionCount >= 3)
+                {
+                    RecordAbilityFailure(abilityGuid, "Consecutive selection without progress");
+                    return true;  // 실패 플래그
+                }
+            }
+            else
+            {
+                LastSelectedAbilityGuid = abilityGuid;
+                ConsecutiveAbilitySelectionCount = 1;
+            }
+
+            return false;
+        }
+
+        /// <summary>마지막 선택 초기화 (명령이 성공적으로 시작된 경우)</summary>
+        public void ClearLastSelection()
+        {
+            LastSelectedAbilityGuid = null;
+            ConsecutiveAbilitySelectionCount = 0;
+        }
+
+        #endregion
+
         #region Constructor
 
         public TurnState(UnitEntityData unit)
@@ -117,19 +225,84 @@ namespace CompanionAI_Pathfinder.Core
             UnitId = unit?.UniqueId ?? "unknown";
             TurnStartFrame = UnityEngine.Time.frameCount;
 
-            // Pathfinder 턴제 라운드 추적
-            // TODO: TurnBased 컨트롤러에서 라운드 가져오기
-            CombatRound = 0;
-
-            // 초기 액션 리소스 설정
-            HasStandardAction = true;
-            HasMoveAction = true;
-            HasSwiftAction = true;
+            // ★ v0.2.78: 게임 API에서 초기 상태 동기화
+            SyncFromGameState(unit);
         }
 
         #endregion
 
         #region Methods
+
+        /// <summary>
+        /// ★ v0.2.78: 게임 API에서 액션 상태 및 라운드 정보 동기화
+        /// 턴제 모드와 실시간 모드 각각에 맞게 처리
+        /// </summary>
+        public void SyncFromGameState(UnitEntityData unit)
+        {
+            if (unit == null)
+            {
+                // 폴백: 기본값
+                HasStandardAction = true;
+                HasMoveAction = true;
+                HasSwiftAction = true;
+                CombatRound = 0;
+                return;
+            }
+
+            try
+            {
+                // 턴제 전투 모드 체크
+                bool isTurnBased = CombatController.IsInTurnBasedCombat();
+
+                if (isTurnBased)
+                {
+                    // ★ 턴제 모드: 게임 API의 액션 메서드 사용
+                    HasStandardAction = unit.HasStandardAction();
+                    HasMoveAction = unit.HasMoveAction();
+                    HasSwiftAction = unit.HasSwiftAction();
+
+                    // 라운드 번호 동기화
+                    var tbController = Game.Instance?.TurnBasedCombatController;
+                    CombatRound = tbController?.RoundNumber ?? 0;
+
+                    Main.Verbose($"[TurnState] Synced (Turn-Based): {unit.CharacterName} - " +
+                                $"Std={HasStandardAction}, Move={HasMoveAction}, Swift={HasSwiftAction}, Round={CombatRound}");
+                }
+                else
+                {
+                    // ★ 실시간 모드: 쿨다운 기반 체크
+                    var cooldown = unit.CombatState?.Cooldown;
+                    if (cooldown != null)
+                    {
+                        HasStandardAction = cooldown.StandardAction <= 0f;
+                        HasMoveAction = cooldown.MoveAction <= 0f;
+                        HasSwiftAction = cooldown.SwiftAction <= 0f;
+                    }
+                    else
+                    {
+                        // 쿨다운 정보 없으면 기본값
+                        HasStandardAction = true;
+                        HasMoveAction = true;
+                        HasSwiftAction = true;
+                    }
+
+                    // 실시간 모드: 라운드 개념 없음 (전투 시작부터 추정)
+                    CombatRound = 1;
+
+                    Main.Verbose($"[TurnState] Synced (Real-Time): {unit.CharacterName} - " +
+                                $"Std={HasStandardAction}, Move={HasMoveAction}, Swift={HasSwiftAction}");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Main.Verbose($"[TurnState] SyncFromGameState error: {ex.Message}");
+                // 에러 시 기본값
+                HasStandardAction = true;
+                HasMoveAction = true;
+                HasSwiftAction = true;
+                CombatRound = 0;
+            }
+        }
 
         /// <summary>
         /// 행동 실행 기록

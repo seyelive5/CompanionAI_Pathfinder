@@ -4,6 +4,7 @@
 // ★ v0.2.48: SpellDescriptor 면역 체크 추가 (악의 눈→드레치 무한 루프 해결)
 // ★ v0.2.49: AoE 위험 지역 탈출 및 CC 탈출 로직 추가
 // ★ v0.2.50: LOS 체크 추가 + 근접 캐릭터 BasicAttack 이동 거리 고려
+// ★ v0.2.109: 도달 가능성 검증 추가 - 이동+공격으로 도달 불가능한 타겟 제외
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -103,6 +104,15 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 // 3. Generate all candidate actions
                 swStep.Restart();
                 var candidates = GenerateCandidates(unit, situation, turnState);
+
+                // ★ v0.2.78: 액션 가용성 기반 필터링 (턴제 모드에서 특히 중요)
+                int beforeFilter = candidates.Count;
+                candidates = FilterByActionAvailability(candidates, situation);
+                if (candidates.Count < beforeFilter)
+                {
+                    Main.Verbose($"[DecisionEngine] Filtered {beforeFilter} → {candidates.Count} by action availability");
+                }
+
                 swStep.Stop();
                 genMs = swStep.ElapsedMilliseconds;
 
@@ -164,6 +174,10 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 }
 
                 var candidates = GenerateCandidates(unit, situation, null);
+
+                // ★ v0.2.78: 액션 가용성 기반 필터링
+                candidates = FilterByActionAvailability(candidates, situation);
+
                 if (candidates.Count == 0)
                     return ActionCandidate.EndTurn("No valid actions");
 
@@ -230,6 +244,9 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
         private void GenerateAttackCandidates(List<ActionCandidate> candidates,
             UnitEntityData unit, Situation situation)
         {
+            string unitId = unit?.UniqueId;
+            int unreachableCount = 0;  // ★ v0.2.109: 도달 불가 카운터
+
             // Ability attacks
             if (situation.AvailableAttacks != null)
             {
@@ -237,6 +254,22 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 {
                     if (attack == null || !attack.IsAvailable)
                         continue;
+
+                    // ★ v0.2.100: 전투 블랙리스트 체크 (2차 방어선)
+                    // SituationAnalyzer에서 필터링되어야 하지만, 누락 방지를 위해 여기서도 체크
+                    if (AbilityClassifier.IsBlacklistedForCombat(attack))
+                    {
+                        Main.Verbose($"[DecisionEngine] Skipping blacklisted ability: {attack.Name}");
+                        continue;
+                    }
+
+                    // ★ v0.2.99: 이번 턴에 실패한 능력 제외 (무한 재시도 방지)
+                    string abilityGuid = attack.Blueprint?.AssetGuid.ToString();
+                    if (!string.IsNullOrEmpty(abilityGuid) && TurnOrchestrator.Instance.IsAbilityFailedThisTurn(unitId, abilityGuid))
+                    {
+                        Main.Verbose($"[DecisionEngine] Skipping failed ability: {attack.Name}");
+                        continue;
+                    }
 
                     // Get targets
                     var targets = GetValidTargets(attack, situation);
@@ -246,6 +279,15 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                         var targetWrapper = new TargetWrapper(enemy);
                         if (!attack.CanTarget(targetWrapper))
                             continue;
+
+                        // ★ v0.2.109: 도달 가능성 검증 (턴제 전투에서 핵심!)
+                        // 이동 + 공격으로 이번 턴에 도달 불가능한 타겟은 제외
+                        if (situation.IsTurnBasedMode && !IsTargetReachable(unit, enemy, attack, situation))
+                        {
+                            unreachableCount++;
+                            Main.Verbose($"[DecisionEngine] ★ EXCLUDED unreachable: {attack.Name} -> {enemy.CharacterName}");
+                            continue;
+                        }
 
                         // ★ v0.2.46: 블랙리스트된 능력+타겟 조합 제외 (Hex 1회 제한 등)
                         if (FailedAbilityTracker.Instance.IsBlacklisted(unit, attack, enemy))
@@ -270,30 +312,53 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 }
             }
 
+            // ★ v0.2.109: 도달 불가 로그 요약
+            if (unreachableCount > 0)
+            {
+                Main.Log($"[DecisionEngine] {unit.CharacterName}: ★ Excluded {unreachableCount} unreachable ability-target combinations");
+            }
+
             // ★ v0.2.25: Basic attack - 무기 범위 기반 (근접/원거리 모두 지원)
             // ★ v0.2.50: 근접 캐릭터는 이동 후 공격 가능 거리까지 고려
+            // ★ v0.2.109: 도달 가능성 검증 강화 - 실제 이동 가능 거리 사용
             var potentialTargets = situation.Enemies ?? Enumerable.Empty<UnitEntityData>();
             float weaponRange = situation.WeaponRange;
             bool isMelee = weaponRange <= 3f;  // 3m 이하면 근접
-
-            // 근접 캐릭터의 경우 이동 가능 거리 추가 (이동 후 공격 가능)
-            float effectiveRange = weaponRange + 1f;
-            if (isMelee && situation.CanMove)
-            {
-                // 근접 캐릭터가 이동 가능하면 이동 거리 고려
-                // 일반적으로 6초 라운드 기준 30ft(~9m) 이동 가능
-                // 기마 상태 등을 고려해 넉넉하게 설정
-                effectiveRange = weaponRange + 10f;  // 이동 후 공격 가능
-            }
+            int basicUnreachableCount = 0;
 
             foreach (var enemy in potentialTargets)
             {
                 if (enemy == null || enemy.Descriptor?.State?.IsDead == true)
                     continue;
 
+                // ★ v0.2.109: 턴제 전투에서 도달 가능성 검증
+                if (situation.IsTurnBasedMode && !IsBasicAttackReachable(unit, enemy, situation))
+                {
+                    basicUnreachableCount++;
+                    continue;
+                }
+
                 float dist = Vector3.Distance(unit.Position, enemy.Position);
 
-                // 무기 범위 내에 있으면 BasicAttack 후보 생성
+                // ★ v0.2.109: 이동 가능 여부에 따른 유효 사거리 계산
+                float effectiveRange;
+                if (dist <= weaponRange + 1f)
+                {
+                    // 이미 무기 사거리 내
+                    effectiveRange = weaponRange + 1f;
+                }
+                else if (situation.HasMoveAction && situation.CanMove)
+                {
+                    // 이동 후 공격 가능 거리 (실제 이동 가능 거리 사용)
+                    effectiveRange = weaponRange + situation.MaxMoveDistance;
+                }
+                else
+                {
+                    // 이동 불가 - 무기 사거리만
+                    effectiveRange = weaponRange + 1f;
+                }
+
+                // 유효 사거리 내인지 확인
                 if (dist <= effectiveRange)
                 {
                     // ★ v0.2.50: LOS 체크 - 원거리 무기의 경우 시야 차단 확인
@@ -313,6 +378,12 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                         Main.Verbose($"[DecisionEngine] BasicAttack BLOCKED by LOS: {enemy.CharacterName} (dist={dist:F1}m)");
                     }
                 }
+            }
+
+            // ★ v0.2.109: BasicAttack 도달 불가 로그
+            if (basicUnreachableCount > 0)
+            {
+                Main.Log($"[DecisionEngine] {unit.CharacterName}: ★ Excluded {basicUnreachableCount} unreachable BasicAttack targets");
             }
         }
 
@@ -680,6 +751,259 @@ namespace CompanionAI_Pathfinder.Core.DecisionEngine
                 return (current / max) * 100f;
             }
             catch { return 100f; }
+        }
+
+        /// <summary>
+        /// ★ v0.2.78: 액션 가용성 기반 후보 필터링
+        /// 턴제 전투에서 이미 사용한 액션 타입의 후보를 제거
+        /// </summary>
+        private List<ActionCandidate> FilterByActionAvailability(
+            List<ActionCandidate> candidates, Situation situation)
+        {
+            // 실시간 모드에서는 필터링 완화 (쿨다운은 짧음)
+            if (!situation.IsTurnBasedMode)
+                return candidates;
+
+            return candidates.Where(c =>
+            {
+                switch (c.ActionType)
+                {
+                    case CandidateType.AbilityAttack:
+                    case CandidateType.BasicAttack:
+                        // 공격은 Standard Action 필요
+                        if (!situation.HasStandardAction)
+                        {
+                            Main.Verbose($"[Filter] Removed {c.ActionType}: No Standard Action");
+                            return false;
+                        }
+                        return true;
+
+                    case CandidateType.Move:
+                        // 이동은 Move Action 필요
+                        if (!situation.HasMoveAction)
+                        {
+                            Main.Verbose($"[Filter] Removed Move: No Move Action");
+                            return false;
+                        }
+                        // 물리적으로 이동 가능한지도 체크
+                        if (!situation.CanMove)
+                        {
+                            Main.Verbose($"[Filter] Removed Move: CanMove=false");
+                            return false;
+                        }
+                        return true;
+
+                    case CandidateType.Buff:
+                        // 버프는 보통 Standard, 일부는 Swift
+                        // Classification에서 ActionType 확인 (있으면)
+                        if (c.Classification != null && IsSwiftAbility(c.Classification))
+                        {
+                            if (!situation.HasSwiftAction)
+                            {
+                                Main.Verbose($"[Filter] Removed Swift Buff: No Swift Action");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            if (!situation.HasStandardAction)
+                            {
+                                Main.Verbose($"[Filter] Removed Standard Buff: No Standard Action");
+                                return false;
+                            }
+                        }
+                        return true;
+
+                    case CandidateType.Heal:
+                    case CandidateType.Debuff:
+                        // 힐과 디버프는 대부분 Standard Action
+                        if (!situation.HasStandardAction)
+                        {
+                            Main.Verbose($"[Filter] Removed {c.ActionType}: No Standard Action");
+                            return false;
+                        }
+                        return true;
+
+                    case CandidateType.EndTurn:
+                        // EndTurn은 항상 가능
+                        return true;
+
+                    default:
+                        // 알 수 없는 타입은 Standard 체크
+                        return situation.HasStandardAction;
+                }
+            }).ToList();
+        }
+
+        /// <summary>
+        /// ★ v0.2.78: 능력이 Swift Action인지 확인
+        /// </summary>
+        private bool IsSwiftAbility(AbilityClassification classification)
+        {
+            if (classification == null)
+                return false;
+
+            // AbilityClassification의 CommandActionType 사용
+            return classification.IsSwiftAction;
+        }
+
+        #endregion
+
+        #region ★ v0.2.109: Reachability Check
+
+        /// <summary>
+        /// ★ v0.2.109: 타겟이 이번 턴에 도달 가능한지 확인
+        /// 핵심 로직: 거리 <= 이동거리 + 능력사거리
+        ///
+        /// 턴제 전투에서 중요:
+        /// - Move + Standard 조합으로 도달 가능해야 공격 가능
+        /// - 도달 불가능한 타겟에 대한 공격은 턴 낭비
+        /// </summary>
+        private bool IsTargetReachable(
+            UnitEntityData unit,
+            UnitEntityData target,
+            AbilityData ability,
+            Situation situation)
+        {
+            if (unit == null || target == null)
+                return false;
+
+            float distance = Vector3.Distance(unit.Position, target.Position);
+
+            // 1. 능력 사거리 계산
+            float abilityRange = GetAbilityEffectiveRange(ability, unit);
+
+            // 2. 이미 사거리 내에 있으면 도달 가능
+            if (distance <= abilityRange + 1f)  // 약간의 여유
+            {
+                Main.Verbose($"[Reachability] {target.CharacterName}: Already in range (dist={distance:F1}m, range={abilityRange:F1}m)");
+                return true;
+            }
+
+            // 3. 이동 액션이 없으면 사거리 밖 타겟은 도달 불가
+            if (!situation.HasMoveAction || !situation.CanMove)
+            {
+                Main.Verbose($"[Reachability] {target.CharacterName}: Out of range and no Move (dist={distance:F1}m, range={abilityRange:F1}m)");
+                return false;
+            }
+
+            // 4. 이동 + 공격으로 도달 가능한지 확인
+            float maxMoveDistance = situation.MaxMoveDistance;
+            float effectiveReach = maxMoveDistance + abilityRange;
+
+            bool reachable = distance <= effectiveReach + 1f;  // 약간의 여유
+
+            if (reachable)
+            {
+                Main.Verbose($"[Reachability] {target.CharacterName}: Reachable with Move+Attack (dist={distance:F1}m, move={maxMoveDistance:F1}m, range={abilityRange:F1}m, total={effectiveReach:F1}m)");
+            }
+            else
+            {
+                Main.Verbose($"[Reachability] {target.CharacterName}: ★ UNREACHABLE (dist={distance:F1}m > move+range={effectiveReach:F1}m)");
+            }
+
+            return reachable;
+        }
+
+        /// <summary>
+        /// ★ v0.2.109: BasicAttack 타겟이 도달 가능한지 확인 (무기 사거리 기반)
+        /// </summary>
+        private bool IsBasicAttackReachable(
+            UnitEntityData unit,
+            UnitEntityData target,
+            Situation situation)
+        {
+            if (unit == null || target == null)
+                return false;
+
+            float distance = Vector3.Distance(unit.Position, target.Position);
+            float weaponRange = situation.WeaponRange;
+            bool isMelee = weaponRange <= 3f;
+
+            // 1. 이미 무기 사거리 내에 있으면 도달 가능
+            if (distance <= weaponRange + 1f)
+            {
+                return true;
+            }
+
+            // 2. 이동 액션이 없으면 사거리 밖 타겟은 도달 불가
+            if (!situation.HasMoveAction || !situation.CanMove)
+            {
+                Main.Verbose($"[Reachability-Basic] {target.CharacterName}: Out of weapon range and no Move (dist={distance:F1}m, wpnRange={weaponRange:F1}m)");
+                return false;
+            }
+
+            // 3. 근접 무기: 이동 + 공격으로 도달 가능한지 확인
+            if (isMelee)
+            {
+                float maxMoveDistance = situation.MaxMoveDistance;
+                float effectiveReach = maxMoveDistance + weaponRange;
+                bool reachable = distance <= effectiveReach + 1f;
+
+                if (!reachable)
+                {
+                    Main.Verbose($"[Reachability-Basic] {target.CharacterName}: ★ MELEE UNREACHABLE (dist={distance:F1}m > move+range={effectiveReach:F1}m)");
+                }
+                return reachable;
+            }
+
+            // 4. 원거리 무기: 보통 충분히 긴 사거리를 가짐
+            // 하지만 혹시 모르니 이동 후 도달 가능한지 체크
+            float rangedEffectiveReach = situation.MaxMoveDistance + weaponRange;
+            bool rangedReachable = distance <= rangedEffectiveReach + 1f;
+
+            if (!rangedReachable)
+            {
+                Main.Verbose($"[Reachability-Basic] {target.CharacterName}: ★ RANGED UNREACHABLE (dist={distance:F1}m > move+range={rangedEffectiveReach:F1}m)");
+            }
+
+            return rangedReachable;
+        }
+
+        /// <summary>
+        /// ★ v0.2.109: 능력의 실제 사거리 계산
+        /// </summary>
+        private float GetAbilityEffectiveRange(AbilityData ability, UnitEntityData unit)
+        {
+            if (ability?.Blueprint == null)
+                return 2f;
+
+            var range = ability.Blueprint.Range;
+
+            switch (range)
+            {
+                case Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Touch:
+                    return 2f + (unit?.Corpulence ?? 0.5f);
+
+                case Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Close:
+                    return 7.5f;  // 25 feet
+
+                case Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Medium:
+                    return 30f;   // 100 feet
+
+                case Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Long:
+                    return 120f;  // 400 feet
+
+                case Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Unlimited:
+                    return 1000f;
+
+                case Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Personal:
+                    return 0f;
+
+                case Kingmaker.UnitLogic.Abilities.Blueprints.AbilityRange.Weapon:
+                    // 무기 사거리 사용
+                    var weapon = unit?.Body?.PrimaryHand?.MaybeWeapon;
+                    if (weapon != null)
+                    {
+                        return weapon.AttackRange.Meters > 0
+                            ? weapon.AttackRange.Meters + (unit?.Corpulence ?? 0.5f)
+                            : (weapon.Blueprint.IsMelee ? 2f : 15f);
+                    }
+                    return 2f;
+
+                default:
+                    return 10f;
+            }
         }
 
         #endregion

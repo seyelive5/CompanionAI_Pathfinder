@@ -70,6 +70,15 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>★ v0.2.25: 주 무기 공격 범위 (미터)</summary>
         public float WeaponRange { get; set; } = 2f;
 
+        /// <summary>★ v0.2.98: 유닛의 이동 속도 (미터/초)</summary>
+        public float MovementSpeed { get; set; } = 6f;
+
+        /// <summary>★ v0.2.98: 이번 턴 최대 이동 가능 거리 (미터)</summary>
+        public float MaxMoveDistance { get; set; } = 9f;
+
+        /// <summary>★ v0.2.98: 근접 공격 도달 범위 (미터)</summary>
+        public float MeleeReach { get; set; } = 2.5f;
+
         #endregion
 
         #region Battlefield
@@ -182,6 +191,12 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>Current combat phase (set by CombatPhaseDetector)</summary>
         public CombatPhase CombatPhase { get; set; } = CombatPhase.Midgame;
 
+        /// <summary>★ v0.2.78: 현재 전투 라운드 (턴제 전용)</summary>
+        public int CurrentRound { get; set; }
+
+        /// <summary>★ v0.2.78: 턴제 전투 모드 여부</summary>
+        public bool IsTurnBasedMode { get; set; }
+
         #endregion
 
         #region Turn State
@@ -236,6 +251,15 @@ namespace CompanionAI_Pathfinder.Analysis
         /// </summary>
         public bool PrefersMelee => RangePreference == RangePreference.Melee;
 
+        /// <summary>★ v0.2.78: 능력 사용 가능 여부 (Standard Action 필요)</summary>
+        public bool CanUseAbility => HasStandardAction && CanAct;
+
+        /// <summary>★ v0.2.78: 기본 공격 가능 여부 (Standard Action 필요)</summary>
+        public bool CanBasicAttack => HasStandardAction && CanAct;
+
+        /// <summary>★ v0.2.78: 이동 가능 여부 (Move Action + 물리적 이동 가능)</summary>
+        public bool CanPerformMove => HasMoveAction && CanMove;
+
         #endregion
 
         #region Tactical Info (★ v0.2.30)
@@ -247,7 +271,8 @@ namespace CompanionAI_Pathfinder.Analysis
 
         public override string ToString()
         {
-            return $"[Situation] {Unit?.CharacterName}: HP={HPPercent:F0}%, Phase={CombatPhase}, " +
+            string modeStr = IsTurnBasedMode ? $"TB-R{CurrentRound}" : "RT";
+            return $"[Situation] {Unit?.CharacterName}: HP={HPPercent:F0}%, Phase={CombatPhase}, Mode={modeStr}, " +
                    $"Std={HasStandardAction}, Move={HasMoveAction}, Swift={HasSwiftAction}, " +
                    $"Enemies={Enemies?.Count ?? 0}, Hittable={HittableEnemies?.Count ?? 0}, " +
                    $"InDanger={IsInDanger}, WpnRange={WeaponRange:F0}m";

@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using HarmonyLib;
 using Kingmaker;
 using Kingmaker.AI;
@@ -7,6 +8,7 @@ using Kingmaker.PubSubSystem;
 using TurnBased.Controllers;
 using CompanionAI_Pathfinder.Abstraction;
 using CompanionAI_Pathfinder.Core;
+using CompanionAI_Pathfinder.Core.TurnBased;
 using CompanionAI_Pathfinder.Core.DecisionEngine;
 using CompanionAI_Pathfinder.Settings;
 
@@ -15,18 +17,27 @@ namespace CompanionAI_Pathfinder.GameInterface
     /// <summary>
     /// AiBrainController에 대한 Harmony 패치
     /// AI 결정을 가로채서 커스텀 AI 로직 실행
+    ///
+    /// ★ v0.2.113: 아키텍처 개선
+    /// - 턴제: TurnControllerTick_Postfix만 사용 → TurnBasedController
+    /// - 실시간: TickBrain_Prefix → RealTimeController
+    /// - TickBrain_Prefix는 턴제에서 호출 안 됨 (게임 로직)
     /// </summary>
     public static class CustomBrainPatch
     {
         private static int _tickCounter = 0;
-        private static int _lastPreBuffFrame = 0;  // ★ v0.2.38: PreBuff tick tracking
+        private static int _lastPreBuffFrame = 0;
 
         /// <summary>
         /// AiBrainController.TickBrain() 패치
-        /// 실시간 전투에서 AI 결정 인터셉트
-        /// 주의: 수동 패치로 적용됨 (Main.PatchTickBrainManually)
+        /// ★ v0.2.113: 실시간 전투 전용
         ///
-        /// v0.2.21: 게임 AI 완전 대체 - 명령 직접 발행 + NextCommandTime 관리
+        /// 게임 분석 결과:
+        /// - 턴제 전투: AiBrainController.Tick()에서 바로 return (ForceTick 안 함)
+        /// - 실시간 전투: Tick() → ForceTick() → TickBrain()
+        ///
+        /// 따라서 턴제에서는 이 메서드가 호출되지 않음!
+        /// 턴제 AI는 TurnControllerTick_Postfix에서 처리
         /// </summary>
         public static bool TickBrain_Prefix(UnitEntityData unit)
         {
@@ -47,44 +58,35 @@ namespace CompanionAI_Pathfinder.GameInterface
                 if (!Main.Enabled)
                     return true;
 
-                // 유닛 정보 로깅
                 string unitName = unit?.Descriptor?.CharacterName ?? "Unknown";
-                bool isPlayerFaction = unit?.IsPlayerFaction ?? false;
-                bool isControllable = unit?.IsDirectlyControllable ?? false;
 
                 // 아군만 제어
                 if (!ShouldControlUnit(unit))
                 {
-                    // 첫 번째 스킵 이유 로깅
-                    if (_tickCounter <= 10)
-                    {
-                        Main.Verbose($"유닛 스킵: {unitName} (PlayerFaction={isPlayerFaction}, Controllable={isControllable})");
-                    }
                     return true;
                 }
 
                 Main.ProcessedUnits++;
 
-                // 전투 모드에 따라 처리
+                // ★ v0.2.113: 턴제/실시간 분기
                 if (CombatController.IsInTurnBasedCombat())
                 {
-                    Main.Verbose($"턴제 모드 - {unitName}: TurnOrchestrator 호출");
-                    // 턴제 모드: TurnOrchestrator가 처리
-                    TurnOrchestrator.Instance.ProcessTurn(unit);
+                    // ★ 턴제 모드에서는 TurnControllerTick_Postfix가 처리
+                    // 이 코드는 실제로 호출되지 않아야 함 (게임이 턴제에서 TickBrain 안 함)
+                    // 혹시 호출되면 무시
+                    Main.Verbose($"[TickBrain] {unitName}: 턴제 모드 - TurnControllerTick에서 처리");
                     return false;
                 }
                 else
                 {
-                    // v0.2.21: 실시간 모드 - 게임 AI 완전 대체
-                    // 1. 게임의 NextCommandTime 체크를 여기서 수행 (게임 AI 로직과 동일)
+                    // ★ 실시간 모드 - 게임 AI 완전 대체
                     float nextTime = unit.CombatState?.AIData?.NextCommandTime ?? 0f;
                     if (nextTime >= UnityEngine.Time.time)
                     {
-                        // 아직 명령 쿨다운 중 - 게임 AI도 대기하므로 우리도 대기
-                        return false;  // 게임 AI 스킵 (우리도 아무것도 안 함)
+                        return false;  // 명령 쿨다운 중
                     }
 
-                    // 2. 진행 중인 능력 시전 체크 (기본 공격은 무시)
+                    // 능력 시전 중 체크
                     bool hasAbilityInProgress = false;
                     if (unit.Commands?.Raw != null)
                     {
@@ -96,7 +98,6 @@ namespace CompanionAI_Pathfinder.GameInterface
                                 if (useAbility.IsStarted && !useAbility.IsActed)
                                 {
                                     hasAbilityInProgress = true;
-                                    Main.Verbose($"[TickBrain] {unitName}: UnitUseAbility 시전 중 - {useAbility.Ability?.Name}");
                                     break;
                                 }
                             }
@@ -108,16 +109,15 @@ namespace CompanionAI_Pathfinder.GameInterface
                         return false;  // 능력 시전 완료 대기
                     }
 
-                    // 3. RealTimeController에서 AI 결정 수행
-                    // ★ v0.2.29: 로그 스팸 감소 - ProcessUnit 내부에서 실제 처리 시에만 로그 출력
+                    // RealTimeController에서 AI 결정 수행
                     RealTimeController.Instance.ProcessUnit(unit);
-                    return false; // 게임 AI 스킵
+                    return false;
                 }
             }
             catch (Exception ex)
             {
                 Main.Error($"TickBrain 패치 오류: {ex.Message}\n{ex.StackTrace}");
-                return true; // 오류 시 원본 실행
+                return true;
             }
         }
 
@@ -174,10 +174,9 @@ namespace CompanionAI_Pathfinder.GameInterface
     public static class TurnBasedPatches
     {
         /// <summary>
-        /// 턴 시작 시 호출
+        /// 턴 시작 시 호출 (수동 패치 - Main.PatchCombatControllerManually)
+        /// 이 시점에서는 Status=Scrolling이므로 실제 AI 호출은 Tick에서 수행
         /// </summary>
-        [HarmonyPatch(typeof(CombatController), "StartTurn")]
-        [HarmonyPostfix]
         public static void StartTurn_Postfix(CombatController __instance)
         {
             try
@@ -198,7 +197,7 @@ namespace CompanionAI_Pathfinder.GameInterface
                 }
 
                 string unitName = currentUnit.Descriptor?.CharacterName ?? "Unknown";
-                Main.Log($"턴 시작: {unitName}");
+                Main.Log($"턴 시작: {unitName} (Status={__instance.CurrentTurn?.Status})");
 
                 if (!CustomBrainPatch.ShouldControlUnit(currentUnit))
                 {
@@ -206,15 +205,151 @@ namespace CompanionAI_Pathfinder.GameInterface
                     return;
                 }
 
-                Main.Log($"★ AI 제어 대상: {unitName}");
-
-                // TurnOrchestrator로 턴 처리
-                var result = TurnOrchestrator.Instance.ProcessTurn(currentUnit);
-                Main.Log($"턴 처리 결과: {result?.Reason ?? "unknown"}");
+                Main.Log($"★ AI 제어 대상: {unitName} - TurnControllerTick에서 처리 예정");
+                // ★ v0.2.86: StartTurn 시점에는 Status=Scrolling이므로 호출하지 않음
+                // TurnControllerTick_Postfix에서 Preparing/Acting 상태일 때 호출
             }
             catch (Exception ex)
             {
                 Main.Error($"StartTurn 패치 오류: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.113: TurnController.Tick() Postfix
+        /// 완전히 재작성 - TurnBasedController 사용
+        ///
+        /// 핵심 원칙:
+        /// 1. Commands.Empty 체크 (RT v3.5.7과 동일)
+        /// 2. TurnBasedController.ProcessTurn() 호출
+        /// 3. 단순화된 흐름
+        /// </summary>
+        public static void TurnControllerTick_Postfix(TurnController __instance)
+        {
+            try
+            {
+                if (!Main.Enabled) return;
+
+                var rider = __instance.Rider;
+                if (rider == null) return;
+
+                // 우리가 제어하는 유닛만
+                if (!CustomBrainPatch.ShouldControlUnit(rider)) return;
+
+                // IsDirectlyControllable 유닛만 (게임이 AI를 호출하지 않는 유닛)
+                if (!rider.IsDirectlyControllable) return;
+
+                var status = __instance.Status;
+                string unitName = rider.Descriptor?.CharacterName ?? "Unknown";
+
+                // Scrolling 상태에서는 대기 (카메라 이동 중)
+                if (status == TurnController.TurnStatus.Scrolling)
+                {
+                    return;
+                }
+
+                // Ended 상태에서는 대기 (턴 종료됨)
+                if (status == TurnController.TurnStatus.Ended)
+                {
+                    return;
+                }
+
+                // ★ v0.2.113: TurnBasedController 호출
+                var result = TurnBasedController.Instance.ProcessTurn(rider);
+
+                // 결과 처리
+                if (result != null)
+                {
+                    if (result.Type == Core.ResultType.EndTurn)
+                    {
+                        Main.Log($"[TurnTick] {unitName}: EndTurn - {result.Reason}");
+
+                        // ★ Acting으로 전환 후 턴 종료 시도
+                        if (status != TurnController.TurnStatus.Acting)
+                        {
+                            ForceStatusToActing(__instance);
+                        }
+
+                        if (__instance.CanEndTurnAndNoActing())
+                        {
+                            __instance.ForceToEnd(true);
+                        }
+                    }
+                    else if (result.Type == Core.ResultType.Waiting)
+                    {
+                        // ★ 명령이 발행된 경우 Acting으로 전환
+                        // 이래야 명령이 tick됨
+                        if (status != TurnController.TurnStatus.Acting)
+                        {
+                            bool hasCommands = rider.Commands.HasUnfinished();
+                            if (hasCommands)
+                            {
+                                Main.Verbose($"[TurnTick] {unitName}: Commands pending - transitioning to Acting");
+                                ForceStatusToActing(__instance);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"TurnControllerTick 패치 오류: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.88: TurnController.Status를 Acting으로 강제 전환
+        /// ★ v0.2.90: 리플렉션 필드 접근으로 변경 (Traverse가 실패할 수 있음)
+        /// </summary>
+        private static void ForceStatusToActing(TurnController controller)
+        {
+            try
+            {
+                // 방법 1: Harmony Traverse (auto-property setter)
+                var traverse = HarmonyLib.Traverse.Create(controller);
+                traverse.Property("Status").SetValue(TurnController.TurnStatus.Acting);
+
+                // 검증
+                if (controller.Status == TurnController.TurnStatus.Acting)
+                {
+                    Main.Verbose($"[TurnTick] Traverse.Property worked - Status is now Acting");
+                    return;
+                }
+
+                Main.Log($"[TurnTick] Traverse.Property failed, trying backing field...");
+
+                // 방법 2: 백킹 필드 직접 접근
+                var backingField = typeof(TurnController).GetField("<Status>k__BackingField",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (backingField != null)
+                {
+                    backingField.SetValue(controller, TurnController.TurnStatus.Acting);
+                    Main.Log($"[TurnTick] Set via backing field - Status = {controller.Status}");
+                    return;
+                }
+
+                Main.Log($"[TurnTick] Backing field not found, trying all private fields...");
+
+                // 방법 3: Status라는 이름의 모든 필드 검색
+                var fields = typeof(TurnController).GetFields(
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Public);
+                foreach (var field in fields)
+                {
+                    if (field.Name.Contains("Status") && field.FieldType == typeof(TurnController.TurnStatus))
+                    {
+                        field.SetValue(controller, TurnController.TurnStatus.Acting);
+                        Main.Log($"[TurnTick] Set via field '{field.Name}' - Status = {controller.Status}");
+                        return;
+                    }
+                }
+
+                Main.Error($"[TurnTick] Could not find any way to set Status!");
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[TurnTick] Failed to force Status: {ex.Message}");
             }
         }
     }
@@ -224,20 +359,23 @@ namespace CompanionAI_Pathfinder.GameInterface
     /// </summary>
     public static class CombatPatches
     {
-        [HarmonyPatch(typeof(CombatController), "Activate")]
-        [HarmonyPostfix]
+        /// <summary>
+        /// 턴제 전투 활성화 시 호출 (수동 패치)
+        /// </summary>
         public static void Activate_Postfix()
         {
             Main.Log("★★★ 턴제 전투 시작됨 ★★★");
         }
 
-        [HarmonyPatch(typeof(CombatController), "Deactivate")]
-        [HarmonyPostfix]
+        /// <summary>
+        /// 턴제 전투 비활성화 시 호출 (수동 패치)
+        /// ★ v0.2.113: TurnBasedController 사용
+        /// </summary>
         public static void Deactivate_Postfix()
         {
             Main.Log("★★★ 턴제 전투 종료됨 ★★★");
-            // 전투 종료 시 TurnOrchestrator 상태 초기화
-            TurnOrchestrator.Instance.ResetAllTurnStates();
+            // ★ v0.2.113: TurnBasedController 상태 초기화
+            TurnBasedController.Instance.ResetAll();
 
             // ★ v0.2.23: Clear pending action tracker
             PendingActionTracker.Instance.Clear();

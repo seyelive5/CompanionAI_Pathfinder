@@ -1,6 +1,7 @@
 // ★ v0.2.66: Combat Rules Analyzer
 // ★ v0.2.67: Resistance/Immunity Analysis 추가
 // ★ v0.2.68: Swift/Free Action AoO 면제 수정
+// ★ v0.2.77: DR (Damage Reduction) 및 Energy Resistance 지원 추가
 // Pathfinder 전투 규칙 분석 - AoO, 위협 범위, 방어적 시전, 저항/면역 등
 using System;
 using System.Collections.Generic;
@@ -110,6 +111,24 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>에너지 면역 목록</summary>
         public List<DamageEnergyType> EnergyImmunities { get; } = new List<DamageEnergyType>();
+
+        /// <summary>★ v0.2.77: 에너지 저항값 (면역이 아닌 경우)</summary>
+        public Dictionary<DamageEnergyType, int> EnergyResistances { get; } = new Dictionary<DamageEnergyType, int>();
+
+        /// <summary>★ v0.2.77: 에너지 저항으로 인한 데미지 효율 (1.0 = 저항 없음)</summary>
+        public float EnergyDamageEfficiency { get; set; } = 1.0f;
+
+        /// <summary>★ v0.2.77: 물리 DR 값</summary>
+        public int PhysicalDR { get; set; }
+
+        /// <summary>★ v0.2.77: DR 타입 (Magic, Cold Iron 등)</summary>
+        public string DRType { get; set; } = "";
+
+        /// <summary>★ v0.2.77: DR 우회 가능 여부</summary>
+        public bool CanBypassDR { get; set; } = true;
+
+        /// <summary>★ v0.2.77: DR로 인한 데미지 효율 (1.0 = DR 없음)</summary>
+        public float PhysicalDamageEfficiency { get; set; } = 1.0f;
 
         /// <summary>상태이상 면역 목록</summary>
         public List<UnitCondition> ConditionImmunities { get; } = new List<UnitCondition>();
@@ -814,6 +833,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 에너지/원소 면역 분석
+        /// ★ v0.2.77: Energy Resistance 값 추적 추가
         /// </summary>
         private static void AnalyzeEnergyImmunity(
             UnitEntityData target,
@@ -828,13 +848,37 @@ namespace CompanionAI_Pathfinder.Analysis
 
                 // 능력의 데미지 타입 추출
                 var damageTypes = GetAbilityEnergyTypes(ability);
+                float totalEfficiency = 1.0f;
+                float estimatedDamage = 30f;  // 기본 추정 데미지
 
                 foreach (var energyType in damageTypes)
                 {
+                    // 1. 면역 체크
                     if (drPart.IsImmune(energyType))
                     {
                         result.EnergyImmunities.Add(energyType);
                         result.ImmunityReasons.Add($"{energyType} Immunity");
+                        totalEfficiency = 0f;  // 면역이면 효율 0
+                        continue;
+                    }
+
+                    // ★ v0.2.77: 저항값 계산 (면역이 아닌 경우)
+                    var energyResult = HitChanceCalculator.CalculateEnergyResistance(target, energyType, estimatedDamage);
+                    if (energyResult.ResistanceValue > 0)
+                    {
+                        result.EnergyResistances[energyType] = energyResult.ResistanceValue;
+
+                        // 효율 업데이트 (여러 에너지 타입 중 최악의 경우 사용)
+                        if (energyResult.DamageEfficiency < totalEfficiency)
+                        {
+                            totalEfficiency = energyResult.DamageEfficiency;
+                        }
+
+                        // 저항이 높으면 사유 추가
+                        if (energyResult.DamageEfficiency < 0.5f)
+                        {
+                            result.ImmunityReasons.Add($"{energyType} Resist {energyResult.ResistanceValue}");
+                        }
                     }
                 }
 
@@ -842,7 +886,10 @@ namespace CompanionAI_Pathfinder.Analysis
                 if (damageTypes.Count > 0 && damageTypes.All(t => result.EnergyImmunities.Contains(t)))
                 {
                     result.ImmunityChance = 1f;
+                    totalEfficiency = 0f;
                 }
+
+                result.EnergyDamageEfficiency = totalEfficiency;
             }
             catch (Exception ex)
             {
@@ -1048,9 +1095,12 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 추천 및 페널티 계산
+        /// ★ v0.2.77: Energy Resistance 효율 반영
         /// </summary>
         private static void CalculateResistanceRecommendation(ResistanceImmunityAnalysis result)
         {
+            float totalPenalty = 0f;
+
             // 완전 면역
             if (result.IsSpellImmune || result.ImmunityChance >= 0.99f)
             {
@@ -1064,38 +1114,60 @@ namespace CompanionAI_Pathfinder.Analysis
             {
                 if (result.SRPenetrationChance >= 0.8f)
                 {
-                    result.Recommendation = ResistanceRecommendation.Effective;
-                    result.PenaltyScore = -5f;  // 약간의 불확실성
+                    totalPenalty += -5f;  // 약간의 불확실성
                 }
                 else if (result.SRPenetrationChance >= 0.5f)
                 {
-                    result.Recommendation = ResistanceRecommendation.PartiallyEffective;
-                    result.PenaltyScore = -20f;
+                    totalPenalty += -20f;
                 }
                 else if (result.SRPenetrationChance >= 0.25f)
                 {
-                    result.Recommendation = ResistanceRecommendation.LikelyResisted;
-                    result.PenaltyScore = -40f;
+                    totalPenalty += -40f;
                 }
                 else
                 {
-                    result.Recommendation = ResistanceRecommendation.LikelyResisted;
-                    result.PenaltyScore = -60f;
+                    totalPenalty += -60f;
                 }
-                return;
+            }
+
+            // ★ v0.2.77: 에너지 저항 효율 반영
+            if (result.EnergyDamageEfficiency < 1.0f)
+            {
+                // 효율이 낮을수록 페널티 증가
+                // 0.5 효율 = -25 페널티, 0.2 효율 = -40 페널티
+                float efficiencyPenalty = -50f * (1f - result.EnergyDamageEfficiency);
+                totalPenalty += efficiencyPenalty;
+
+                if (result.EnergyDamageEfficiency < 0.3f)
+                {
+                    // 30% 미만 효율이면 추천하지 않음
+                    result.Recommendation = ResistanceRecommendation.LikelyResisted;
+                    result.PenaltyScore = totalPenalty;
+                    return;
+                }
             }
 
             // 부분 면역 (일부 효과만)
             if (result.ImmunityChance > 0f && result.ImmunityChance < 0.99f)
             {
-                result.Recommendation = ResistanceRecommendation.PartiallyEffective;
-                result.PenaltyScore = -15f * result.ImmunityChance;
-                return;
+                totalPenalty += -15f * result.ImmunityChance;
             }
 
-            // 완전 효과적
-            result.Recommendation = ResistanceRecommendation.Effective;
-            result.PenaltyScore = 0f;
+            // 최종 추천 결정
+            if (totalPenalty < -60f)
+            {
+                result.Recommendation = ResistanceRecommendation.LikelyResisted;
+            }
+            else if (totalPenalty < -30f)
+            {
+                result.Recommendation = ResistanceRecommendation.PartiallyEffective;
+            }
+            else
+            {
+                result.Recommendation = ResistanceRecommendation.Effective;
+            }
+
+            result.PenaltyScore = totalPenalty;
         }
 
         /// <summary>

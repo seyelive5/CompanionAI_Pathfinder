@@ -5,11 +5,13 @@ using System.Linq;
 using Kingmaker;
 using Kingmaker.Blueprints;
 using Kingmaker.EntitySystem.Entities;
+using Kingmaker.UnitLogic;
 using Kingmaker.UnitLogic.Abilities;
 using Kingmaker.UnitLogic.Abilities.Components;
 using Kingmaker.UnitLogic.Commands;
 using Kingmaker.UnitLogic.Mechanics.Actions;
 using Kingmaker.Utility;
+using TurnBased.Controllers;
 using UnityEngine;
 using CompanionAI_Pathfinder.Core;
 using CompanionAI_Pathfinder.Settings;
@@ -26,35 +28,12 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>
         /// v0.2.9: 타입 기반 블랙리스트 체크 (스트링 매칭 금지)
         /// 능력의 컴포넌트에서 특정 ContextAction 타입을 검사
+        /// ★ v0.2.100: AbilityClassifier.IsBlacklistedForCombat() 사용 (로직 통합)
         /// </summary>
         private bool IsBlacklisted(AbilityData ability)
         {
-            if (ability?.Blueprint == null) return false;
-
-            try
-            {
-                // v0.2.9: Demoralize 액션을 포함하는 능력 블랙리스트
-                // AbilityEffectRunAction 컴포넌트에서 Demoralize 타입 확인
-                var runAction = ability.Blueprint.GetComponent<AbilityEffectRunAction>();
-                if (runAction?.Actions?.Actions != null)
-                {
-                    foreach (var action in runAction.Actions.Actions)
-                    {
-                        // Demoralize ContextAction 타입 체크
-                        if (action is Demoralize)
-                        {
-                            Main.Verbose($"[Analyzer] BLACKLISTED: {ability.Name} (contains Demoralize action)");
-                            return true;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Main.Verbose($"[Analyzer] IsBlacklisted error: {ex.Message}");
-            }
-
-            return false;
+            // ★ v0.2.100: 공유 메서드 사용
+            return AbilityClassifier.IsBlacklistedForCombat(ability);
         }
 
         #endregion
@@ -155,10 +134,8 @@ namespace CompanionAI_Pathfinder.Analysis
             situation.CanMove = CanMove(unit);
             situation.CanAct = CanAct(unit);
 
-            // Pathfinder 액션 시스템
-            situation.HasStandardAction = turnState?.HasStandardAction ?? true;
-            situation.HasMoveAction = turnState?.HasMoveAction ?? true;
-            situation.HasSwiftAction = turnState?.HasSwiftAction ?? true;
+            // ★ v0.2.78: 게임 API에서 직접 액션 가용성 가져오기
+            PopulateActionAvailability(situation, unit, turnState);
 
             // v0.2.18: 스닉 어택 보유 감지
             // ★ v0.2.62: AbilityClassifier.HasSneakAttack() 사용 (문자열 검색 제거)
@@ -180,6 +157,85 @@ namespace CompanionAI_Pathfinder.Analysis
             catch { }
         }
 
+        /// <summary>
+        /// ★ v0.2.78: 게임 API에서 직접 액션 가용성 및 전투 모드 정보 가져오기
+        /// 턴제 모드: unit.HasStandardAction() 등 게임 메서드 사용
+        /// 실시간 모드: 쿨다운 기반 체크
+        /// </summary>
+        private void PopulateActionAvailability(Situation situation, UnitEntityData unit, TurnState turnState)
+        {
+            try
+            {
+                // 전투 모드 감지
+                bool isTurnBased = CombatController.IsInTurnBasedCombat();
+                situation.IsTurnBasedMode = isTurnBased;
+
+                if (isTurnBased)
+                {
+                    // ★ 턴제 모드: 게임 API 직접 사용 (가장 정확)
+                    situation.HasStandardAction = unit.HasStandardAction();
+                    situation.HasMoveAction = unit.HasMoveAction();
+                    situation.HasSwiftAction = unit.HasSwiftAction();
+
+                    // 이동 가능 여부: Move Action 있고 + 물리적으로 이동 가능
+                    situation.CanMove = unit.HasMoveAction() &&
+                                       !(unit.Descriptor?.State?.HasCondition(UnitCondition.CantMove) ?? false);
+
+                    // 라운드 번호
+                    var tbController = Game.Instance?.TurnBasedCombatController;
+                    situation.CurrentRound = tbController?.RoundNumber ?? 0;
+
+                    Main.Verbose($"[Analyzer] Action (TB): {unit.CharacterName} - " +
+                                $"Std={situation.HasStandardAction}, Move={situation.HasMoveAction}, " +
+                                $"Swift={situation.HasSwiftAction}, Round={situation.CurrentRound}");
+                }
+                else
+                {
+                    // ★ 실시간 모드: TurnState에서 가져오거나 쿨다운 직접 체크
+                    if (turnState != null)
+                    {
+                        // TurnState가 이미 동기화되어 있으면 사용
+                        situation.HasStandardAction = turnState.HasStandardAction;
+                        situation.HasMoveAction = turnState.HasMoveAction;
+                        situation.HasSwiftAction = turnState.HasSwiftAction;
+                    }
+                    else
+                    {
+                        // 직접 쿨다운 체크
+                        var cooldown = unit.CombatState?.Cooldown;
+                        if (cooldown != null)
+                        {
+                            situation.HasStandardAction = cooldown.StandardAction <= 0f;
+                            situation.HasMoveAction = cooldown.MoveAction <= 0f;
+                            situation.HasSwiftAction = cooldown.SwiftAction <= 0f;
+                        }
+                        else
+                        {
+                            situation.HasStandardAction = true;
+                            situation.HasMoveAction = true;
+                            situation.HasSwiftAction = true;
+                        }
+                    }
+
+                    situation.CurrentRound = 1; // 실시간: 항상 1
+
+                    Main.Verbose($"[Analyzer] Action (RT): {unit.CharacterName} - " +
+                                $"Std={situation.HasStandardAction}, Move={situation.HasMoveAction}, " +
+                                $"Swift={situation.HasSwiftAction}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Verbose($"[Analyzer] PopulateActionAvailability error: {ex.Message}");
+                // 폴백: TurnState 또는 기본값
+                situation.HasStandardAction = turnState?.HasStandardAction ?? true;
+                situation.HasMoveAction = turnState?.HasMoveAction ?? true;
+                situation.HasSwiftAction = turnState?.HasSwiftAction ?? true;
+                situation.IsTurnBasedMode = false;
+                situation.CurrentRound = 1;
+            }
+        }
+
         private void LoadSettings(Situation situation, UnitEntityData unit)
         {
             var settings = ModSettings.Instance;
@@ -197,6 +253,11 @@ namespace CompanionAI_Pathfinder.Analysis
 
             // ★ v0.2.25: 무기 공격 범위 계산
             situation.WeaponRange = GetWeaponAttackRange(unit);
+
+            // ★ v0.2.98: 이동 능력 정보 설정
+            situation.MovementSpeed = unit.CurrentSpeedMps;
+            situation.MaxMoveDistance = GameInterface.MovementAPI.GetMaxMoveDistance(unit);
+            situation.MeleeReach = GameInterface.MovementAPI.GetMeleeReachDistance(unit);
         }
 
         /// <summary>

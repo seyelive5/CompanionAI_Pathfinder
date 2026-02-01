@@ -12,6 +12,8 @@ using Kingmaker.UnitLogic;
 using Kingmaker.UnitLogic.Abilities;
 using Kingmaker.UnitLogic.Abilities.Blueprints;
 using Kingmaker.UnitLogic.Abilities.Components;
+using Kingmaker.UnitLogic.Commands;
+using Kingmaker.UnitLogic.Commands.Base;
 using Kingmaker.UnitLogic.Abilities.Components.Base;
 using Kingmaker.UnitLogic.Buffs.Blueprints;
 using Kingmaker.UnitLogic.FactLogic;
@@ -57,6 +59,12 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>★ v0.2.40: 인챈트 보너스 (탐지된 경우)</summary>
         public int EnchantmentBonus { get; private set; }
 
+        /// <summary>★ v0.2.101: Fatigued 조건 적용 여부</summary>
+        public bool AppliesFatigue { get; private set; }
+
+        /// <summary>★ v0.2.101: Exhausted 조건 적용 여부</summary>
+        public bool AppliesExhausted { get; private set; }
+
         /// <summary>★ v0.2.40: 인챈트 설정</summary>
         public void SetEnchantment(int bonus = 0)
         {
@@ -67,6 +75,7 @@ namespace CompanionAI_Pathfinder.Analysis
 
         /// <summary>
         /// 버프 추가
+        /// ★ v0.2.101: AddCondition 컴포넌트 분석 추가 (Fatigue/Exhausted 감지)
         /// </summary>
         public void AddBuff(BlueprintBuff buff, bool isPermanent, bool isLong)
         {
@@ -77,10 +86,36 @@ namespace CompanionAI_Pathfinder.Analysis
             {
                 AppliedBuffGuids.Add(guid);
                 AppliedBuffs.Add(buff);
+
+                // ★ v0.2.101: 버프가 적용하는 조건 분석
+                AnalyzeBuffConditions(buff);
             }
 
             if (isPermanent) HasPermanentBuff = true;
             if (isLong) IsLongDuration = true;
+        }
+
+        /// <summary>
+        /// ★ v0.2.101: 버프의 AddCondition 컴포넌트 분석
+        /// </summary>
+        private void AnalyzeBuffConditions(BlueprintBuff buff)
+        {
+            try
+            {
+                var addCondition = buff.GetComponent<AddCondition>();
+                if (addCondition != null)
+                {
+                    if (addCondition.Condition == UnitCondition.Fatigued)
+                    {
+                        AppliesFatigue = true;
+                    }
+                    else if (addCondition.Condition == UnitCondition.Exhausted)
+                    {
+                        AppliesExhausted = true;
+                    }
+                }
+            }
+            catch { }
         }
 
         /// <summary>
@@ -379,6 +414,12 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>v0.2.18: 요구 세이브 타입 (Will/Reflex/Fortitude)</summary>
         public SavingThrowType? RequiredSave { get; set; }
 
+        /// <summary>★ v0.2.78: 액션 타입 (Standard, Move, Swift, Free)</summary>
+        public UnitCommand.CommandType CommandActionType { get; set; } = UnitCommand.CommandType.Standard;
+
+        /// <summary>★ v0.2.78: Full-Round Action 여부 (Standard + Move 소비)</summary>
+        public bool IsFullRoundAction { get; set; }
+
         #endregion
 
         #region Constructor
@@ -403,6 +444,10 @@ namespace CompanionAI_Pathfinder.Analysis
             TargetingType = TargetingType.None;
             School = SpellSchool.None;
             AbilityType = AbilityType.Special;
+
+            // ★ v0.2.78: 액션 타입 기본값
+            CommandActionType = UnitCommand.CommandType.Standard;
+            IsFullRoundAction = false;
         }
 
         #endregion
@@ -456,6 +501,15 @@ namespace CompanionAI_Pathfinder.Analysis
                                      Timing == AbilityTiming.PermanentBuff ||
                                      Timing == AbilityTiming.Channel;
 
+        /// <summary>★ v0.2.78: Swift Action인지 여부</summary>
+        public bool IsSwiftAction => CommandActionType == UnitCommand.CommandType.Swift;
+
+        /// <summary>★ v0.2.78: Free Action인지 여부</summary>
+        public bool IsFreeAction => CommandActionType == UnitCommand.CommandType.Free;
+
+        /// <summary>★ v0.2.78: Standard Action인지 여부</summary>
+        public bool IsStandardAction => CommandActionType == UnitCommand.CommandType.Standard;
+
         #endregion
 
         #region ToString
@@ -499,12 +553,20 @@ namespace CompanionAI_Pathfinder.Analysis
         private static readonly Dictionary<string, AbilityBuffEffects> _abilityBuffCache = new Dictionary<string, AbilityBuffEffects>();
 
         /// <summary>
+        /// ★ v0.2.102: 능력 분류 결과 캐시 (GUID 문자열 기반)
+        /// Blueprint 속성만 분석하므로 캐싱 가능
+        /// </summary>
+        private static readonly Dictionary<string, AbilityClassification> _classificationCache = new Dictionary<string, AbilityClassification>();
+
+        /// <summary>
         /// 캐시 클리어 (게임 재시작 시 등)
         /// </summary>
         public static void ClearCache()
         {
             _abilityBuffCache.Clear();
-            Main.Log("[AbilityClassifier] Cache cleared");
+            _classificationCache.Clear();
+            _ccRemovalCache.Clear();
+            Main.Log("[AbilityClassifier] All caches cleared");
         }
 
         /// <summary>
@@ -728,6 +790,7 @@ namespace CompanionAI_Pathfinder.Analysis
         /// <summary>
         /// 능력 분류 (v0.2.0 Enhanced)
         /// Blueprint의 SpellDescriptor, School, AbilityType 등 상세 속성 활용
+        /// ★ v0.2.102: GUID 기반 캐싱 추가 - Blueprint 속성만 분석하므로 캐싱 가능
         /// </summary>
         public static AbilityClassification Classify(AbilityData ability, UnitEntityData caster = null)
         {
@@ -736,6 +799,14 @@ namespace CompanionAI_Pathfinder.Analysis
                     AbilityResourceType.Free, 0, 0f);
 
             var bp = ability.Blueprint;
+
+            // ★ v0.2.102: 캐시 확인
+            string abilityGuid = bp.AssetGuid.ToString();
+            if (_classificationCache.TryGetValue(abilityGuid, out var cached))
+            {
+                // 캐시된 분류 결과 반환 (Ability 참조만 업데이트)
+                return CloneWithAbility(cached, ability);
+            }
             int spellLevel = ability.SpellLevel;
 
             // 리소스 타입 결정
@@ -853,7 +924,77 @@ namespace CompanionAI_Pathfinder.Analysis
                 result.RequiredSave = buffEffects.DetectedSaveType;
             }
 
+            // ★ v0.2.78: 액션 타입 결정
+            DetermineActionType(ability, result);
+
+            // ★ v0.2.102: 결과 캐싱
+            _classificationCache[abilityGuid] = result;
+
             return result;
+        }
+
+        /// <summary>
+        /// ★ v0.2.102: 캐시된 분류 결과를 복제하면서 Ability 참조만 업데이트
+        /// AbilityData는 인스턴스마다 다를 수 있으므로 복제 필요
+        /// </summary>
+        private static AbilityClassification CloneWithAbility(AbilityClassification cached, AbilityData ability)
+        {
+            var clone = new AbilityClassification(
+                ability,
+                cached.Timing,
+                cached.ResourceType,
+                cached.SpellLevel,
+                cached.ResourceScore,
+                cached.AppliedBuff,
+                cached.IsPermanentBuff)
+            {
+                CCType = cached.CCType,
+                DamageElement = cached.DamageElement,
+                DebuffType = cached.DebuffType,
+                TargetingType = cached.TargetingType,
+                School = cached.School,
+                AbilityType = cached.AbilityType,
+                AoERadius = cached.AoERadius,
+                Range = cached.Range,
+                IsMindAffecting = cached.IsMindAffecting,
+                IsDeathEffect = cached.IsDeathEffect,
+                IsTouch = cached.IsTouch,
+                IsRangedTouch = cached.IsRangedTouch,
+                RequiredSave = cached.RequiredSave,
+                CommandActionType = cached.CommandActionType,
+                IsFullRoundAction = cached.IsFullRoundAction
+            };
+
+            return clone;
+        }
+
+        /// <summary>
+        /// ★ v0.2.78: 능력의 액션 타입 결정 (Standard/Move/Swift/Free)
+        /// </summary>
+        private static void DetermineActionType(AbilityData ability, AbilityClassification result)
+        {
+            try
+            {
+                var bp = ability?.Blueprint;
+                if (bp == null) return;
+
+                // 1. Blueprint에서 ActionType 가져오기
+                result.CommandActionType = bp.ActionType;
+
+                // 2. Full-Round Action 체크
+                result.IsFullRoundAction = bp.IsFullRoundAction;
+
+                // 3. 로깅
+                if (result.CommandActionType != UnitCommand.CommandType.Standard ||
+                    result.IsFullRoundAction)
+                {
+                    Main.Verbose($"[AbilityClassifier] {ability.Name}: ActionType={result.CommandActionType}, FullRound={result.IsFullRoundAction}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Verbose($"[AbilityClassifier] DetermineActionType error: {ex.Message}");
+            }
         }
 
         #region v0.2.0 Enhanced Analysis Methods
@@ -1974,6 +2115,176 @@ namespace CompanionAI_Pathfinder.Analysis
         {
             _ccRemovalCache.Clear();
             Main.Log("[AbilityClassifier] CC Removal cache cleared");
+        }
+
+        #endregion
+
+        #region ★ v0.2.100: Combat Blacklist (Shared)
+
+        /// <summary>
+        /// ★ v0.2.101: 전투에서 사용하면 안 되는 능력인지 확인 (공유 메서드)
+        /// SituationAnalyzer와 UnifiedDecisionEngine 모두에서 사용
+        /// 버프 효과 분석 (AppliesFatigue 등)을 활용하여 정확한 감지
+        /// ★ v0.2.110: HasVariants 체크 추가 - 부모 능력(키네티시스트 블라스트 등) 제외
+        /// </summary>
+        public static bool IsBlacklistedForCombat(AbilityData ability)
+        {
+            if (ability?.Blueprint == null) return false;
+
+            try
+            {
+                var bp = ability.Blueprint;
+                var descriptor = bp.SpellDescriptor;
+
+                // ★ v0.2.110: 부모 능력 체크 (하위 메뉴가 있는 능력)
+                // 키네티시스트 블라스트, 원소 공격 등은 부모 능력이며 직접 시전 불가
+                // 게임 API: IsSuitableForAutoUse도 HasVariants를 체크함
+                if (bp.HasVariants)
+                {
+                    Main.Verbose($"[AbilityClassifier] BLACKLISTED: {ability.Name} (Parent ability with variants - not directly castable)");
+                    return true;
+                }
+
+                // 1. Demoralize 액션 포함 능력 블랙리스트 (AI가 제대로 사용 못함)
+                var runAction = bp.GetComponent<AbilityEffectRunAction>();
+                if (runAction?.Actions?.Actions != null)
+                {
+                    foreach (var action in runAction.Actions.Actions)
+                    {
+                        if (action is Demoralize)
+                        {
+                            Main.Verbose($"[AbilityClassifier] BLACKLISTED: {ability.Name} (Demoralize action)");
+                            return true;
+                        }
+                    }
+                }
+
+                // ★ v0.2.107: 터치 스펠 체크 (SpellLevel과 무관)
+                // 피로의 손길 같은 능력이 SpellLevel 0이 아닐 수 있음 (위치 헥스 등)
+                bool isTouch = bp.GetComponent<AbilityDeliverTouch>() != null ||
+                               bp.GetComponent<AbilityEffectStickyTouch>() != null;
+                bool canTargetEnemy = bp.CanTargetEnemies;
+
+                if (isTouch && canTargetEnemy)
+                {
+                    // 데미지와 Fatigue 디버프 분석
+                    bool hasDamage = false;
+                    bool appliesFatigueDebuff = false;
+
+                    if (runAction?.Actions?.Actions != null)
+                    {
+                        AnalyzeActionsForDebuffs(runAction.Actions.Actions, ref hasDamage, ref appliesFatigueDebuff, 0);
+                    }
+
+                    // ★ v0.2.107: Fatigue 디버프만 적용하는 터치 스펠 = 무쓸모 (SpellLevel 무관)
+                    if (appliesFatigueDebuff && !hasDamage)
+                    {
+                        Main.Log($"[AbilityClassifier] BLACKLISTED: {ability.Name} (Fatigue-only touch spell, SpellLevel={ability.SpellLevel})");
+                        return true;
+                    }
+
+                    // SpellDescriptor.Fatigue가 있는 터치 스펠 = 무쓸모
+                    if ((descriptor & SpellDescriptor.Fatigue) != 0 && !hasDamage)
+                    {
+                        Main.Log($"[AbilityClassifier] BLACKLISTED: {ability.Name} (Fatigue descriptor touch spell)");
+                        return true;
+                    }
+                }
+
+                // 2. 캔트립(0레벨) 전용 블랙리스트
+                if (ability.SpellLevel == 0)
+                {
+                    // 적에게 사용하는 터치 캔트립 + 데미지 없음 = 무쓸모
+                    if (canTargetEnemy && isTouch)
+                    {
+                        bool hasDamage = false;
+                        bool appliesFatigueDebuff = false;
+                        if (runAction?.Actions?.Actions != null)
+                        {
+                            AnalyzeActionsForDebuffs(runAction.Actions.Actions, ref hasDamage, ref appliesFatigueDebuff, 0);
+                        }
+                        if (!hasDamage)
+                        {
+                            Main.Log($"[AbilityClassifier] BLACKLISTED: {ability.Name} (Enemy-targeting touch cantrip with no damage)");
+                            return true;
+                        }
+                    }
+
+                    // Daze: HD 제한이 너무 낮아서 전투에서 거의 쓸모없음
+                    if ((descriptor & SpellDescriptor.Daze) != 0)
+                    {
+                        Main.Verbose($"[AbilityClassifier] BLACKLISTED: {ability.Name} (Daze cantrip - low HD limit)");
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Main.Verbose($"[AbilityClassifier] IsBlacklistedForCombat error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.103: 액션 트리를 재귀적으로 분석하여 데미지와 Fatigue 디버프 감지
+        /// Touch of Fatigue처럼 적에게 Fatigue 디버프만 적용하는 능력 감지용
+        /// </summary>
+        private static void AnalyzeActionsForDebuffs(GameAction[] actions, ref bool hasDamage, ref bool appliesFatigueDebuff, int depth)
+        {
+            if (actions == null || depth > 10) return;
+
+            foreach (var action in actions)
+            {
+                if (action == null) continue;
+
+                // 데미지 액션 체크
+                if (action is ContextActionDealDamage)
+                {
+                    hasDamage = true;
+                }
+
+                // 버프/디버프 적용 체크
+                if (action is ContextActionApplyBuff applyBuff && applyBuff.Buff != null)
+                {
+                    try
+                    {
+                        // 버프가 Fatigue/Exhausted 조건을 적용하는지 직접 체크
+                        var addCondition = applyBuff.Buff.GetComponent<AddCondition>();
+                        if (addCondition != null)
+                        {
+                            if (addCondition.Condition == UnitCondition.Fatigued ||
+                                addCondition.Condition == UnitCondition.Exhausted)
+                            {
+                                appliesFatigueDebuff = true;
+                                Main.Verbose($"[AbilityClassifier] Found Fatigue debuff in buff: {applyBuff.Buff.name}");
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // 재귀: Conditional
+                if (action is Conditional conditional)
+                {
+                    AnalyzeActionsForDebuffs(conditional.IfTrue?.Actions, ref hasDamage, ref appliesFatigueDebuff, depth + 1);
+                    AnalyzeActionsForDebuffs(conditional.IfFalse?.Actions, ref hasDamage, ref appliesFatigueDebuff, depth + 1);
+                }
+
+                // 재귀: ContextActionSavingThrow (내성 굴림 후 효과)
+                if (action is ContextActionSavingThrow savingThrow)
+                {
+                    AnalyzeActionsForDebuffs(savingThrow.Actions?.Actions, ref hasDamage, ref appliesFatigueDebuff, depth + 1);
+                }
+
+                // 재귀: ContextActionConditionalSaved
+                if (action is ContextActionConditionalSaved conditionalSaved)
+                {
+                    AnalyzeActionsForDebuffs(conditionalSaved.Failed?.Actions, ref hasDamage, ref appliesFatigueDebuff, depth + 1);
+                    AnalyzeActionsForDebuffs(conditionalSaved.Succeed?.Actions, ref hasDamage, ref appliesFatigueDebuff, depth + 1);
+                }
+            }
         }
 
         #endregion

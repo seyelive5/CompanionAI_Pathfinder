@@ -1,5 +1,6 @@
 // ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
 // ★ v0.2.56: 적 위협 감지 개선 - 명령 타겟 분석
+// ★ v0.2.72: 적중 확률 기반 타겟팅 - HitChanceCalculator 통합
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -189,13 +190,25 @@ namespace CompanionAI_Pathfinder.Analysis
                 score += roleBonus;
 
                 // ═══════════════════════════════════════════════════════════════
-                // 7. AC 기반 타겟팅 - 물리 공격자만
+                // 7. ★ v0.2.72: 적중 확률 기반 타겟팅 - 물리 공격자만
+                //    실제 공격 보너스와 타겟 AC를 비교하여 적중 확률 계산
                 // ═══════════════════════════════════════════════════════════════
                 if (IsPhysicalAttacker(attacker))
                 {
-                    int targetAC = analysis?.AC ?? 20;
-                    float acScore = (30f - targetAC) * 1.0f;
-                    score += acScore * weights.ACVulnerability;
+                    // 실제 적중 확률 계산
+                    var hitResult = HitChanceCalculator.CalculateWeaponHitChance(attacker, target);
+                    float hitChance = hitResult?.HitChance ?? 0.5f;
+
+                    // 적중 확률을 점수로 변환
+                    // 95% = +30, 50% = 0, 5% = -30
+                    float hitScore = (hitChance - 0.5f) * 60f;
+                    score += hitScore * weights.ACVulnerability;
+
+                    // 적중 확률이 매우 낮으면 (20% 미만) 추가 페널티
+                    if (hitChance < 0.2f)
+                    {
+                        score -= 20f;
+                    }
                 }
 
                 // ═══════════════════════════════════════════════════════════════

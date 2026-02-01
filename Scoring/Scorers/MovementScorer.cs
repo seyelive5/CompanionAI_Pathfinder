@@ -1,6 +1,7 @@
 // ★ v0.2.22: Unified Decision Engine - Movement Scorer
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
 // ★ v0.2.50: 이미 최적 위치일 때 이동 점수 대폭 하락 (이동 루프 방지)
+// ★ v0.2.111: 도달 가능한 적이 있으면 MovementNeed 감소 (Attack이 자동 이동 처리)
 using System;
 using System.Linq;
 using Kingmaker.EntitySystem.Entities;
@@ -249,16 +250,13 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             // ═══════════════════════════════════════════════════════════════
             // 2. 이동 필요성 (현재 위치에서 공격 가능하면 이동 불필요)
             // ★ v0.2.50: 이미 최적 위치면 이동 필요성 대폭 하락
+            // ★ v0.2.111: Move+Attack으로 도달 가능하면 이동 필요성 감소
+            //            (게임의 Attack 명령이 자동으로 이동 처리)
             // ═══════════════════════════════════════════════════════════════
             float movementNeed = 0.5f;  // 기본값
             bool currentInOptimalRange = IsInOptimalRange(situation.NearestEnemyDistance, situation.RangePreference);
 
-            if (!situation.HasHittableEnemies && situation.HasLivingEnemies)
-            {
-                // 공격할 적이 없으면 이동 필요
-                movementNeed = 1.0f;
-            }
-            else if (situation.HasHittableEnemies)
+            if (situation.HasHittableEnemies)
             {
                 // 이미 공격 가능
                 if (currentInOptimalRange)
@@ -270,6 +268,32 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 {
                     // 공격은 가능하지만 위치 개선 여지 있음
                     movementNeed = 0.25f;
+                }
+            }
+            else if (situation.HasLivingEnemies)
+            {
+                // ★ v0.2.112: 현재 Hittable 없음 - 도달 가능 여부 체크
+                // 게임의 Attack 명령은 자동으로 이동 후 공격하므로
+                // 도달 가능한 적이 있으면 별도 Move 후보 생성 불필요!
+                float weaponRange = situation.WeaponRange;
+                float maxReach = situation.MaxMoveDistance + weaponRange;
+                float nearestDist = situation.NearestEnemyDistance;
+
+                Main.Log($"[MovementScorer] ★ ReachCheck: WpnRange={weaponRange:F1}m, MaxMove={situation.MaxMoveDistance:F1}m, " +
+                         $"MaxReach={maxReach:F1}m, NearestEnemy={nearestDist:F1}m");
+
+                if (nearestDist <= maxReach + 1f)
+                {
+                    // ★ v0.2.112: 이동+공격으로 도달 가능
+                    // Attack 명령이 자동으로 이동 처리하므로 별도 Move는 매우 낮은 점수
+                    movementNeed = 0.12f;  // v0.2.111 0.4 → v0.2.112 0.12 (더욱 강력하게 억제)
+                    Main.Log($"[MovementScorer] ★★★ Enemy REACHABLE via Attack! MovementNeed={movementNeed:F2} (Attack will auto-move)");
+                }
+                else
+                {
+                    // 이동+공격으로도 도달 불가 - 이동 필요
+                    movementNeed = 1.0f;
+                    Main.Verbose($"[MovementScorer] Enemy NOT reachable ({nearestDist:F1}m > {maxReach:F1}m), MovementNeed=1.0");
                 }
             }
             cs.Add("MovementNeed", movementNeed);

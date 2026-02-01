@@ -6,6 +6,7 @@ using Kingmaker.AI;
 using Kingmaker.EntitySystem.Entities;
 using CompanionAI_Pathfinder.GameInterface;
 using CompanionAI_Pathfinder.Settings;
+using TurnBased.Controllers;
 
 namespace CompanionAI_Pathfinder
 {
@@ -135,11 +136,165 @@ namespace CompanionAI_Pathfinder
                 TickBrainPatched = true;
                 PatchStatus = "성공";
                 Log("★ TickBrain 수동 패치 성공!");
+
+                // ★ v0.2.78: CombatController 패치 추가
+                PatchCombatControllerManually();
             }
             catch (Exception ex)
             {
                 PatchStatus = $"실패: {ex.Message}";
                 Error($"TickBrain 수동 패치 실패: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.78: CombatController 메서드들 수동 패치
+        /// 턴제 전투 시작/종료 감지를 위해 필요
+        /// </summary>
+        private static void PatchCombatControllerManually()
+        {
+            try
+            {
+                // 1. StartTurn(UnitEntityData unit) 패치
+                var startTurnMethod = AccessTools.Method(
+                    typeof(CombatController),
+                    "StartTurn",
+                    new Type[] { typeof(UnitEntityData) }
+                );
+
+                if (startTurnMethod != null)
+                {
+                    var startTurnPostfix = AccessTools.Method(
+                        typeof(TurnBasedPatches),
+                        "StartTurn_Postfix"
+                    );
+
+                    if (startTurnPostfix != null)
+                    {
+                        HarmonyInstance.Patch(
+                            startTurnMethod,
+                            postfix: new HarmonyMethod(startTurnPostfix)
+                        );
+                        Log("  패치됨: CombatController.StartTurn");
+                    }
+                    else
+                    {
+                        Error("StartTurn_Postfix 메서드를 찾을 수 없습니다!");
+                    }
+                }
+                else
+                {
+                    Error("CombatController.StartTurn 메서드를 찾을 수 없습니다!");
+                }
+
+                // 2. Activate() 패치
+                var activateMethod = AccessTools.Method(
+                    typeof(CombatController),
+                    "Activate"
+                );
+
+                if (activateMethod != null)
+                {
+                    var activatePostfix = AccessTools.Method(
+                        typeof(CombatPatches),
+                        "Activate_Postfix"
+                    );
+
+                    if (activatePostfix != null)
+                    {
+                        HarmonyInstance.Patch(
+                            activateMethod,
+                            postfix: new HarmonyMethod(activatePostfix)
+                        );
+                        Log("  패치됨: CombatController.Activate");
+                    }
+                }
+                else
+                {
+                    Error("CombatController.Activate 메서드를 찾을 수 없습니다!");
+                }
+
+                // 3. Deactivate() 패치
+                var deactivateMethod = AccessTools.Method(
+                    typeof(CombatController),
+                    "Deactivate"
+                );
+
+                if (deactivateMethod != null)
+                {
+                    var deactivatePostfix = AccessTools.Method(
+                        typeof(CombatPatches),
+                        "Deactivate_Postfix"
+                    );
+
+                    if (deactivatePostfix != null)
+                    {
+                        HarmonyInstance.Patch(
+                            deactivateMethod,
+                            postfix: new HarmonyMethod(deactivatePostfix)
+                        );
+                        Log("  패치됨: CombatController.Deactivate");
+                    }
+                }
+                else
+                {
+                    Error("CombatController.Deactivate 메서드를 찾을 수 없습니다!");
+                }
+
+                // ★ v0.2.86: TurnController.Tick() 패치 추가
+                // IsDirectlyControllable 유닛에게 AI를 호출하기 위해 필요
+                PatchTurnControllerTickManually();
+
+                Log("★ CombatController 수동 패치 완료!");
+            }
+            catch (Exception ex)
+            {
+                Error($"CombatController 수동 패치 실패: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// ★ v0.2.86: TurnController.Tick() 수동 패치
+        /// 게임은 IsDirectlyControllable 유닛에게 ForceTick()을 호출하지 않음
+        /// 우리가 Preparing/Acting 상태에서 직접 AI를 호출해야 함
+        /// </summary>
+        private static void PatchTurnControllerTickManually()
+        {
+            try
+            {
+                var tickMethod = AccessTools.Method(
+                    typeof(TurnController),
+                    "Tick"
+                );
+
+                if (tickMethod != null)
+                {
+                    var tickPostfix = AccessTools.Method(
+                        typeof(TurnBasedPatches),
+                        "TurnControllerTick_Postfix"
+                    );
+
+                    if (tickPostfix != null)
+                    {
+                        HarmonyInstance.Patch(
+                            tickMethod,
+                            postfix: new HarmonyMethod(tickPostfix)
+                        );
+                        Log("  패치됨: TurnController.Tick");
+                    }
+                    else
+                    {
+                        Error("TurnControllerTick_Postfix 메서드를 찾을 수 없습니다!");
+                    }
+                }
+                else
+                {
+                    Error("TurnController.Tick 메서드를 찾을 수 없습니다!");
+                }
+            }
+            catch (Exception ex)
+            {
+                Error($"TurnController.Tick 패치 실패: {ex.Message}\n{ex.StackTrace}");
             }
         }
 

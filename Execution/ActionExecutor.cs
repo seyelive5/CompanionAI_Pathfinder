@@ -1,4 +1,4 @@
-// ★ v0.2.30: BattlefieldGrid 위치 검증 추가
+// ★ v0.2.116: 능력 타겟팅 실패 시 기본 공격 폴백 추가
 using System;
 using System.Collections.Generic;
 using Kingmaker;
@@ -7,6 +7,7 @@ using Kingmaker.UnitLogic.Abilities;
 using Kingmaker.UnitLogic.Commands;
 using Kingmaker.UnitLogic.Commands.Base;
 using Kingmaker.Utility;
+using TurnBased.Controllers;
 using UnityEngine;
 using CompanionAI_Pathfinder.Analysis;
 using CompanionAI_Pathfinder.Core;
@@ -109,6 +110,14 @@ namespace CompanionAI_Pathfinder.Execution
             if (!ability.CanTarget(target))
             {
                 Main.Log($"[Executor] Cannot target: {ability.Name} -> {GetTargetName(target)}");
+
+                // ★ v0.2.116: 공격 타입이고 유닛 타겟이면 기본 공격으로 폴백
+                if (action.Type == ActionType.Attack && target.Unit != null)
+                {
+                    Main.Log($"[Executor] Falling back to basic attack: {unit.CharacterName} -> {target.Unit.CharacterName}");
+                    return ExecuteBasicAttack(target.Unit, unit);
+                }
+
                 return ExecutionResult.Failure($"Cannot target: {GetTargetName(target)}");
             }
 
@@ -124,16 +133,75 @@ namespace CompanionAI_Pathfinder.Execution
 
         /// <summary>
         /// 단일 타겟 능력 실행
+        /// ★ v0.2.82: 명령 발행 결과 검증 추가
+        /// ★ v0.2.89: 상세 명령 상태 로깅 추가
+        /// ★ v0.2.92: 게임 AI 시스템 호환 - AiAction 설정
         /// </summary>
         private ExecutionResult ExecuteSingleTargetAbility(AbilityData ability, TargetWrapper target, UnitEntityData unit)
         {
             try
             {
+                // ★ v0.2.84: 디버그 - 명령 발행 전 상태 확인
+                var tbController = Game.Instance?.TurnBasedCombatController;
+                var currentTurn = tbController?.CurrentTurn;
+                bool isCurrentUnit = unit.IsCurrentUnit();
+                string riderName = currentTurn?.Rider?.CharacterName ?? "null";
+                string turnStatus = currentTurn?.Status.ToString() ?? "null";
+
+                Main.Log($"[Executor] PRE-RUN: {unit.CharacterName}");
+                Main.Log($"[Executor]   IsCurrentUnit={isCurrentUnit}, Rider={riderName}, Status={turnStatus}");
+
+                // ★ v0.2.82: 발행 전 상태 확인
+                bool wasEmpty = unit.Commands.Empty;
+                bool wasHasUnfinished = unit.Commands.HasUnfinished();
+
                 // Pathfinder 명령 시스템으로 실행
                 var command = new UnitUseAbility(ability, target);
+
+                // ★ v0.2.92: 게임 AI 시스템과 호환
+                // 게임의 AiBrainController.SelectAction()과 동일한 방식으로 설정
+                var aiAction = ability.DefaultAiAction;
+                if (aiAction != null)
+                {
+                    command.AiAction = aiAction;
+                    Main.Verbose($"[Executor] Set AiAction: {aiAction.DebugName}");
+                }
+
+                // ★ v0.2.92: NextCommandTime 설정 (게임 AI와 동일)
+                // Free/Swift 아닌 경우 0.3초 + 랜덤 지연
+                if (command.Type != UnitCommand.CommandType.Free && command.Type != UnitCommand.CommandType.Swift)
+                {
+                    unit.CombatState.AIData.NextCommandTime = UnityEngine.Time.time + 0.3f + UnityEngine.Random.Range(0f, 0.1f);
+                }
+
                 unit.Commands.Run(command);
 
-                Main.Log($"[Executor] Cast: {ability.Name} -> {GetTargetName(target)}");
+                // ★ v0.2.89: 상세 명령 상태 로깅
+                bool isInRunningCommands = currentTurn?.IsRunningCommand(command) ?? false;
+                Main.Log($"[Executor] POST-RUN: Empty={unit.Commands.Empty}, HasUnfinished={unit.Commands.HasUnfinished()}, InRunning={isInRunningCommands}");
+                Main.Log($"[Executor]   Command: Started={command.IsStarted}, Running={command.IsRunning}, Finished={command.IsFinished}, Acted={command.IsActed}");
+
+                // ★ v0.2.89: 슬롯 상태 로깅
+                int slotIdx = 0;
+                foreach (var cmd in unit.Commands.Raw)
+                {
+                    if (cmd != null)
+                    {
+                        bool isSameCmd = ReferenceEquals(cmd, command);
+                        Main.Log($"[Executor]   Slot[{slotIdx}]: {cmd.GetType().Name} (Started={cmd.IsStarted}, Finished={cmd.IsFinished}) {(isSameCmd ? "← OUR CMD" : "")}");
+                    }
+                    slotIdx++;
+                }
+
+                // ★ v0.2.82: 명령이 실제로 등록됐는지 검증
+                if (unit.Commands.Empty && wasEmpty)
+                {
+                    Main.Log($"[Executor] Command NOT registered: {ability.Name} -> {GetTargetName(target)}");
+                    Main.Log($"[Executor] Possible cause: CanRunCommand() returned false (CantUseStandardActions or not conscious)");
+                    return ExecutionResult.Failure($"Command not registered: {ability.Name}");
+                }
+
+                Main.Log($"[Executor] Cast: {ability.Name} -> {GetTargetName(target)} (Command registered)");
                 return ExecutionResult.CastAbility(ability, target);
             }
             catch (Exception ex)
@@ -172,18 +240,32 @@ namespace CompanionAI_Pathfinder.Execution
 
         /// <summary>
         /// ★ v0.2.22: 기본 공격 실행 (UnitAttack)
-        /// UnifiedDecisionEngine에서 BasicAttack 타입으로 요청 시 호출
+        /// ★ v0.2.82: 명령 발행 결과 검증 추가
+        /// ★ v0.2.92: 게임 AI 시스템 호환 - NextCommandTime 설정
         /// </summary>
         private ExecutionResult ExecuteBasicAttack(UnitEntityData target, UnitEntityData unit)
         {
             try
             {
+                bool wasEmpty = unit.Commands.Empty;
+
                 var command = new UnitAttack(target);
+
+                // ★ v0.2.92: NextCommandTime 설정 (게임 AI와 동일)
+                unit.CombatState.AIData.NextCommandTime = UnityEngine.Time.time + 0.3f + UnityEngine.Random.Range(0f, 0.1f);
+
                 unit.Commands.Run(command);
 
-                string targetName = target.CharacterName;
-                Main.Log($"[Executor] BasicAttack: {unit.CharacterName} -> {targetName}");
-                return ExecutionResult.BasicAttack(targetName);
+                // ★ v0.2.82: 명령 등록 검증
+                if (unit.Commands.Empty && wasEmpty)
+                {
+                    string targetName = target.CharacterName;
+                    Main.Log($"[Executor] BasicAttack NOT registered: {unit.CharacterName} -> {targetName}");
+                    return ExecutionResult.Failure($"BasicAttack not registered");
+                }
+
+                Main.Log($"[Executor] BasicAttack: {unit.CharacterName} -> {target.CharacterName} (Command registered)");
+                return ExecutionResult.BasicAttack(target.CharacterName);
             }
             catch (Exception ex)
             {
@@ -195,6 +277,8 @@ namespace CompanionAI_Pathfinder.Execution
         /// <summary>
         /// 이동 실행
         /// ★ v0.2.30: BattlefieldGrid 위치 검증 추가
+        /// ★ v0.2.82: 명령 발행 결과 검증 추가
+        /// ★ v0.2.93: approachRadius 문제 수정 - 0f 대신 적절한 값 사용
         /// </summary>
         private ExecutionResult ExecuteMove(PlannedAction action, UnitEntityData unit)
         {
@@ -214,11 +298,27 @@ namespace CompanionAI_Pathfinder.Execution
                     return ExecutionResult.Failure("Move target invalid: not walkable or occupied");
                 }
 
-                // Pathfinder 이동 명령
-                var command = new UnitMoveTo(destination, 0f);
+                bool wasEmpty = unit.Commands.Empty;
+
+                // ★ v0.2.93: 첫 번째 생성자 사용 (MaxApproachRadius=1000000f)
+                // approachRadius=0f는 정확히 목적지에 도달해야 해서 IsUnitCloseEnough()=false 발생
+                // 첫 번째 생성자는 ApproachRadius를 설정하지 않아 MaxApproachRadius만 적용됨
+                var command = new UnitMoveTo(destination);
+
+                // ★ v0.2.92: NextCommandTime 설정 (게임 AI와 동일)
+                // Move 명령은 Standard가 아니므로 짧은 지연
+                unit.CombatState.AIData.NextCommandTime = UnityEngine.Time.time + 0.1f;
+
                 unit.Commands.Run(command);
 
-                Main.Log($"[Executor] Move to: ({destination.x:F1}, {destination.z:F1})");
+                // ★ v0.2.82: 명령 등록 검증
+                if (unit.Commands.Empty && wasEmpty)
+                {
+                    Main.Log($"[Executor] Move NOT registered: ({destination.x:F1}, {destination.z:F1})");
+                    return ExecutionResult.Failure("Move command not registered");
+                }
+
+                Main.Log($"[Executor] Move to: ({destination.x:F1}, {destination.z:F1}) (Command registered)");
                 return ExecutionResult.MoveTo(destination);
             }
             catch (Exception ex)
@@ -230,15 +330,63 @@ namespace CompanionAI_Pathfinder.Execution
 
         /// <summary>
         /// 유닛이 명령 실행 중인지 확인
-        /// v0.2.3: HasUnfinished() 사용으로 더 정확한 체크
+        /// ★ v0.2.83: 로그 트레이더 모드와 동일하게 Commands.Empty 기반으로 변경
+        ///
+        /// 게임 분석 결과 (UnitCommandController.cs, TurnController.cs):
+        /// - Commands.Run() → OnRun() → StartInTbm() → m_RunningCommands에 추가
+        /// - 다음 프레임: UnitCommandController.TickOnUnit() → TickCommand()
+        /// - TickCommandTurnBased() 조건 통과 → ShouldStartCommand() → command.Start()
+        /// - command.IsRunning이 되면 command.Tick() 실행
+        ///
+        /// v0.2.81의 문제점:
+        /// - IsStarted=false인 명령을 무시 → 다음 틱에서 새 명령으로 덮어쓰기
+        /// - UnitCommandController가 Start()를 호출할 기회가 없음
+        ///
+        /// 해결: 슬롯에 미완료 명령이 있으면 무조건 대기 (게임이 처리할 때까지)
+        /// 로그 트레이더 CombatAPI.IsCommandQueueEmpty()와 동일한 로직 사용
         /// </summary>
         public bool IsExecutingCommand(UnitEntityData unit)
         {
             if (unit?.Commands == null) return false;
 
-            // v0.2.3: HasUnfinished()가 더 정확함 - 완료되었지만 아직 정리되지 않은 명령 처리
-            // Empty는 슬롯이 null인지만 체크, HasUnfinished는 실제 완료 여부 체크
-            return unit.Commands.HasUnfinished();
+            // ★ v0.2.83: 슬롯에 미완료 명령이 있으면 게임이 처리할 때까지 대기
+            // 게임의 UnitCommandController가 Start() → Tick()을 처리함
+            foreach (var cmd in unit.Commands.Raw)
+            {
+                if (cmd == null) continue;
+                if (cmd.IsFinished) continue;
+
+                // ★ v0.2.83: IsStarted 여부와 관계없이 미완료 명령이 있으면 대기
+                Main.Verbose($"[Executor] Pending command: {cmd.GetType().Name} (Started={cmd.IsStarted}, Running={cmd.IsRunning}, Finished={cmd.IsFinished})");
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// ★ v0.2.81: 디버그용 - 현재 명령 상태 로깅
+        /// </summary>
+        public void LogCommandState(UnitEntityData unit, string context)
+        {
+            if (unit?.Commands == null)
+            {
+                Main.Log($"[Executor] {context}: Commands is null");
+                return;
+            }
+
+            var commands = unit.Commands;
+            Main.Log($"[Executor] {context}: HasUnfinished={commands.HasUnfinished()}, Empty={commands.Empty}");
+
+            int idx = 0;
+            foreach (var cmd in commands.Raw)
+            {
+                if (cmd != null)
+                {
+                    Main.Log($"  [{idx}] {cmd.GetType().Name}: Started={cmd.IsStarted}, Running={cmd.IsRunning}, Finished={cmd.IsFinished}, Acted={cmd.IsActed}");
+                }
+                idx++;
+            }
         }
 
         /// <summary>

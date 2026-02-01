@@ -2,6 +2,7 @@
 // ★ v0.2.36: Enhanced with duplicate debuff check, immunity check, combat phase awareness
 // ★ v0.2.37: Geometric Mean Scoring with Considerations
 // ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
+// ★ v0.2.74: Save DC 계산 통합 - 실제 세이브 실패 확률 기반 스코어링
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -64,6 +65,37 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 }
 
                 // ═══════════════════════════════════════════════════════════════
+                // 0.5 ★ v0.2.74: Spell Resistance 체크
+                // ═══════════════════════════════════════════════════════════════
+                if (candidate.Ability != null)
+                {
+                    var srResult = HitChanceCalculator.CalculateSpellResistance(
+                        situation.Unit, target, candidate.Ability);
+
+                    if (srResult.IsImmune)
+                    {
+                        Main.Verbose($"[DebuffScorer] {candidate.Ability.Name}: Target {target.CharacterName} is SPELL IMMUNE");
+                        candidate.BaseScore = -100f;
+                        candidate.Considerations.AddVeto("SpellImmune", false);
+                        return;
+                    }
+
+                    // SR이 높아서 돌파 확률이 낮으면 페널티
+                    if (srResult.AllowsSR && srResult.TargetSR > 0)
+                    {
+                        if (srResult.PenetrationChance < 0.3f)
+                        {
+                            score -= 25f;  // 30% 미만 돌파율 = 상당한 페널티
+                            Main.Verbose($"[DebuffScorer] {candidate.Ability.Name}: Low SR penetration {srResult.PenetrationChance:P0} vs {target.CharacterName}");
+                        }
+                        else if (srResult.PenetrationChance < 0.5f)
+                        {
+                            score -= 10f;  // 50% 미만
+                        }
+                    }
+                }
+
+                // ═══════════════════════════════════════════════════════════════
                 // 1. ★ v0.2.36: 기존 디버프 체크 (중복 시전 방지)
                 // ═══════════════════════════════════════════════════════════════
                 if (HasSimilarDebuff(target, candidate))
@@ -81,6 +113,26 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
                 float targetValue = TargetScorer.ScoreDebuffTarget(
                     target, saveType, situation, isMindAffecting, isHardCC);
                 score += targetValue * 0.5f;
+
+                // ═══════════════════════════════════════════════════════════════
+                // 2.5 ★ v0.2.74: 실제 세이브 DC 기반 성공률 체크
+                // ═══════════════════════════════════════════════════════════════
+                if (candidate.Ability != null)
+                {
+                    var saveDCResult = HitChanceCalculator.CalculateSaveDC(
+                        situation.Unit, target, candidate.Ability, saveType);
+
+                    if (saveDCResult != null)
+                    {
+                        // 세이브 실패 확률이 높으면 보너스
+                        if (saveDCResult.FailureChance > 0.7f)
+                            score += 15f;  // 70%+ 실패 확률 = 좋은 타겟
+                        else if (saveDCResult.FailureChance < 0.2f)
+                            score -= 30f;  // 20% 미만 실패 = 낭비 가능성
+
+                        Main.Verbose($"[DebuffScorer] {candidate.Ability.Name}: SaveDC check - {saveDCResult}");
+                    }
+                }
 
                 // ═══════════════════════════════════════════════════════════════
                 // 3. CC type considerations
@@ -211,6 +263,24 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
 
             // ═══════════════════════════════════════════════════════════════
+            // 2.5 ★ v0.2.74: Spell Resistance 체크
+            // ═══════════════════════════════════════════════════════════════
+            if (candidate.Ability != null)
+            {
+                var srResult = HitChanceCalculator.CalculateSpellResistance(
+                    situation.Unit, target, candidate.Ability);
+
+                // 스펠 면역이면 Veto
+                cs.AddVeto("NotSpellImmune", !srResult.IsImmune);
+
+                // SR 돌파 확률을 Consideration에 추가
+                if (srResult.AllowsSR && srResult.TargetSR > 0)
+                {
+                    cs.Add("SRPenetration", srResult.PenetrationChance);
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
             // 3. 중복 디버프 체크
             // ═══════════════════════════════════════════════════════════════
             bool hasSimilar = HasSimilarDebuff(target, candidate);
@@ -256,12 +326,36 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             }
 
             // ═══════════════════════════════════════════════════════════════
-            // 9. 세이브 타입 매칭 (약한 세이브 타겟팅) - ★ v0.2.52: TargetAnalyzer 사용
+            // 9. ★ v0.2.74: 세이브 기반 점수 - 실제 세이브 실패 확률 계산
             // ═══════════════════════════════════════════════════════════════
             var saveType = candidate.Classification?.RequiredSave;
-            if (saveType.HasValue)
+            if (saveType.HasValue && candidate.Ability != null)
             {
-                // TargetAnalyzer의 WeakestSaveType과 비교
+                // (a) 약한 세이브 타입 매칭 보너스 유지
+                float saveMatchScore = TargetNormalizer.WeakSaveBonus(saveType.Value, analysis.WeakestSaveType);
+                cs.Add("SaveMatch", saveMatchScore);
+
+                // (b) ★ v0.2.74: 실제 세이브 DC와 타겟 세이브 보너스로 실패 확률 계산
+                var saveDCResult = HitChanceCalculator.CalculateSaveDC(
+                    situation.Unit,
+                    target,
+                    candidate.Ability,
+                    saveType);
+
+                // 세이브 실패 확률이 높을수록 좋음 (0.0~1.0)
+                float failureChance = saveDCResult?.FailureChance ?? 0.5f;
+                cs.Add("SaveFailure", failureChance);
+
+                // 세이브 실패 확률이 너무 낮으면 패널티 (10% 미만)
+                if (failureChance < 0.1f)
+                {
+                    cs.Add("LowSavePenalty", 0.3f);  // 70% 패널티
+                    Main.Verbose($"[DebuffScorer] {candidate.Ability?.Name}: Low save failure {failureChance:P0} vs {target.CharacterName}");
+                }
+            }
+            else if (saveType.HasValue)
+            {
+                // 능력 데이터 없으면 타입 매칭만
                 float saveMatchScore = TargetNormalizer.WeakSaveBonus(saveType.Value, analysis.WeakestSaveType);
                 cs.Add("SaveMatch", saveMatchScore);
             }

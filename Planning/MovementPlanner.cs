@@ -32,13 +32,61 @@ namespace CompanionAI_Pathfinder.Planning
         private static readonly Dictionary<string, (List<Vector3> positions, float lastTime)> _moveHistory
             = new Dictionary<string, (List<Vector3>, float)>();
 
+        /// <summary>
+        /// ★ v0.2.97: 이동이 차단된 유닛 (oscillation 감지 후 일시적 차단)
+        /// Key: unitId, Value: 차단된 시간
+        /// </summary>
+        private static readonly Dictionary<string, float> _movementBlockedUnits = new Dictionary<string, float>();
+
         private const int MAX_HISTORY = 5;  // 최대 기록 수
         private const float HISTORY_TIMEOUT = 10f;  // 기록 만료 시간 (초)
         private const float OSCILLATION_THRESHOLD = 4f;  // 같은 위치로 간주하는 거리
+        private const float MOVEMENT_BLOCK_DURATION = 2.0f;  // ★ v0.2.97: 이동 차단 지속 시간 (초)
+
+        /// <summary>
+        /// ★ v0.2.97: 유닛이 이동 차단 상태인지 확인
+        /// Oscillation 감지 후 일정 시간 동안 모든 이동 시도 차단
+        /// </summary>
+        public static bool IsMovementBlocked(string unitId)
+        {
+            if (string.IsNullOrEmpty(unitId))
+                return false;
+
+            if (!_movementBlockedUnits.TryGetValue(unitId, out float blockedTime))
+                return false;
+
+            // 차단 시간 경과 확인
+            if (Time.time - blockedTime > MOVEMENT_BLOCK_DURATION)
+            {
+                _movementBlockedUnits.Remove(unitId);
+                Main.Verbose($"[MovementPlanner] Movement block expired for {unitId}");
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// ★ v0.2.97: 유닛 이동 차단 설정
+        /// ★ v0.2.99: 차단 시 히스토리도 초기화 - 차단 해제 후 새로 시작하도록
+        /// </summary>
+        private static void BlockMovement(string unitId)
+        {
+            if (string.IsNullOrEmpty(unitId))
+                return;
+
+            _movementBlockedUnits[unitId] = Time.time;
+
+            // ★ v0.2.99: 히스토리 초기화 - 차단 해제 후 같은 패턴으로 또 감지되는 것 방지
+            _moveHistory.Remove(unitId);
+
+            Main.Log($"[MovementPlanner] ★ Movement blocked for {unitId} for {MOVEMENT_BLOCK_DURATION}s (history cleared)");
+        }
 
         /// <summary>
         /// ★ v0.2.65: 이동 진동 감지
         /// 최근 이동 기록에서 비슷한 위치를 왔다갔다 하는지 확인
+        /// ★ v0.2.97: 감지 시 이동 차단 설정
         /// </summary>
         private static bool IsOscillating(string unitId, Vector3 newPosition)
         {
@@ -65,6 +113,8 @@ namespace CompanionAI_Pathfinder.Planning
                     if (similarCount >= 2)
                     {
                         Main.Log($"[MovementPlanner] ★ Oscillation detected for {unitId} - blocking repeated movement");
+                        // ★ v0.2.97: 이동 차단 설정 - 일정 시간 동안 이동 시도 자체를 막음
+                        BlockMovement(unitId);
                         return true;
                     }
                 }
@@ -100,10 +150,12 @@ namespace CompanionAI_Pathfinder.Planning
 
         /// <summary>
         /// ★ v0.2.65: 이동 기록 초기화 (전투 종료 시 호출)
+        /// ★ v0.2.97: 이동 차단 목록도 초기화
         /// </summary>
         public static void ClearMoveHistory()
         {
             _moveHistory.Clear();
+            _movementBlockedUnits.Clear();
         }
 
         #endregion
@@ -120,6 +172,28 @@ namespace CompanionAI_Pathfinder.Planning
         /// <returns>이동 행동 또는 null</returns>
         public static MoveDecision PlanMove(Situation situation, string roleName, bool forceMove = false)
         {
+            // ★ v0.2.97: 이동 차단 상태 체크 (oscillation 감지 후)
+            string unitId = situation.Unit?.UniqueId;
+            if (IsMovementBlocked(unitId))
+            {
+                Main.Verbose($"[{roleName}] PlanMove: Movement blocked due to oscillation");
+                return null;
+            }
+
+            // ★ v0.2.78: Move Action 가용성 체크 (턴제 전투용)
+            if (!situation.HasMoveAction)
+            {
+                Main.Verbose($"[{roleName}] PlanMove: No Move Action available");
+                return null;
+            }
+
+            // ★ v0.2.78: 물리적 이동 가능 체크
+            if (!situation.CanMove)
+            {
+                Main.Verbose($"[{roleName}] PlanMove: CanMove=false");
+                return null;
+            }
+
             // forceMove=true면 HasHittableEnemies 체크 스킵
             // 원거리 캐릭터가 위험 거리 내에 있으면 후퇴 이동 허용
             if (!forceMove && situation.HasHittableEnemies)
@@ -152,6 +226,22 @@ namespace CompanionAI_Pathfinder.Planning
         public static MoveDecision PlanRetreat(Situation situation, string roleName)
         {
             if (situation.HasMovedThisTurn) return null;
+
+            // ★ v0.2.97: 이동 차단 상태 체크 (oscillation 감지 후)
+            string unitId = situation.Unit?.UniqueId;
+            if (IsMovementBlocked(unitId))
+            {
+                Main.Verbose($"[{roleName}] PlanRetreat: Movement blocked due to oscillation");
+                return null;
+            }
+
+            // ★ v0.2.78: Move Action 가용성 체크 (턴제 전투용)
+            if (!situation.HasMoveAction)
+            {
+                Main.Verbose($"[{roleName}] PlanRetreat: No Move Action available");
+                return null;
+            }
+
             if (!situation.CanMove) return null;
 
             var unit = situation.Unit;
@@ -342,6 +432,7 @@ namespace CompanionAI_Pathfinder.Planning
         /// <summary>
         /// 원거리 공격 위치 계획
         /// ★ v0.2.65: 이동 루프 감지 추가
+        /// ★ v0.2.94: Range 캐릭터는 적에게 접근하지 않음 - 후퇴 또는 제자리
         /// </summary>
         private static MoveDecision PlanRangedPosition(Situation situation, UnitEntityData target, string roleName)
         {
@@ -359,31 +450,38 @@ namespace CompanionAI_Pathfinder.Planning
 
             if (bestPosition == null)
             {
-                // ★ v0.2.65: LOS 확보된 위치가 없으면 접근 시도
-                // 단, 진동 감지 시 이동 중단
-                var approachPosition = MovementAPI.FindApproachPosition(
-                    unit, target, situation.Enemies, situation.InfluenceMap);
-
-                if (approachPosition != null)
+                // ★ v0.2.94: Range 캐릭터는 적에게 접근하지 않음!
+                // 대신 위험 상황이면 후퇴 시도
+                if (situation.IsInDanger)
                 {
-                    // ★ v0.2.65: 진동 감지
-                    if (IsOscillating(unitId, approachPosition.Position))
-                    {
-                        Main.Log($"[{roleName}] Movement blocked - oscillation detected, waiting for better opportunity");
-                        return null;
-                    }
+                    var retreatPosition = MovementAPI.FindRetreatPosition(
+                        unit,
+                        situation.Enemies,
+                        situation.MinSafeDistance,
+                        situation.InfluenceMap
+                    );
 
-                    RecordMovement(unitId, approachPosition.Position);
-                    Main.Log($"[{roleName}] No attack position, approach to ({approachPosition.Position.x:F1},{approachPosition.Position.z:F1})");
-                    return new MoveDecision
+                    if (retreatPosition != null)
                     {
-                        Destination = approachPosition.Position,
-                        Reason = $"Approach {target.CharacterName}",
-                        Score = approachPosition.TotalScore
-                    };
+                        if (IsOscillating(unitId, retreatPosition.Position))
+                        {
+                            Main.Log($"[{roleName}] Retreat blocked - oscillation detected");
+                            return null;
+                        }
+
+                        RecordMovement(unitId, retreatPosition.Position);
+                        Main.Log($"[{roleName}] No attack position, tactical retreat to ({retreatPosition.Position.x:F1},{retreatPosition.Position.z:F1})");
+                        return new MoveDecision
+                        {
+                            Destination = retreatPosition.Position,
+                            Reason = $"Retreat - no safe attack position",
+                            Score = retreatPosition.TotalScore
+                        };
+                    }
                 }
 
-                Main.Verbose($"[{roleName}] No safe ranged position found");
+                // 안전하고 공격 위치도 없으면 제자리 유지
+                Main.Verbose($"[{roleName}] No safe ranged position found, staying put");
                 return null;
             }
 
@@ -481,6 +579,16 @@ namespace CompanionAI_Pathfinder.Planning
         /// </summary>
         public static MoveDecision PlanPostActionSafeRetreat(Situation situation, string roleName)
         {
+            // ★ v0.2.97: 이동 차단 상태 체크 (oscillation 감지 후)
+            string unitId = situation.Unit?.UniqueId;
+            if (IsMovementBlocked(unitId))
+            {
+                Main.Verbose($"[{roleName}] PlanPostActionSafeRetreat: Movement blocked due to oscillation");
+                return null;
+            }
+
+            // ★ v0.2.78: Move Action 가용성 체크 (턴제 전투용)
+            if (!situation.HasMoveAction) return null;
             if (!situation.CanMove) return null;
             if (!situation.PrefersRanged) return null;
 

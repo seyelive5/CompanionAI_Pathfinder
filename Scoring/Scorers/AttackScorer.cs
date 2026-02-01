@@ -3,6 +3,10 @@
 // ★ v0.2.41: Charge ability distance penalty
 // ★ v0.2.52: TargetAnalyzer 통합 - 중복 분석 코드 제거
 // ★ v0.2.66: AoO 페널티 통합 - CombatRulesAnalyzer 사용
+// ★ v0.2.72: 적중 확률 계산 통합 - HitChanceCalculator 사용
+// ★ v0.2.75: 연속 공격 페널티 (Iterative Attacks) 반영
+// ★ v0.2.99: Kineticist Burn 비용 사전 체크 - UnitUseAbility.CanStart 거부 방지
+// ★ v0.2.111: Hittable 점수 개선 - 이동 후 도달 가능한 타겟에 높은 점수 부여
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -13,6 +17,7 @@ using Kingmaker.Items;
 using Kingmaker.RuleSystem;
 using Kingmaker.UnitLogic.Abilities;
 using Kingmaker.UnitLogic.Abilities.Components;
+using Kingmaker.UnitLogic.Class.Kineticist;
 using Kingmaker.UnitLogic.Mechanics.Actions;
 using Kingmaker.Utility;
 using UnityEngine;
@@ -100,19 +105,74 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
             if (candidate.Target == null)
                 return;  // Veto - 추가 평가 불필요
 
+            // ═══════════════════════════════════════════════════════════════
+            // ★ v0.2.78: Standard Action 가용성 (Veto) - 턴제 전투용
+            // ═══════════════════════════════════════════════════════════════
+            if (situation.IsTurnBasedMode)
+            {
+                cs.AddVeto("HasStandardAction", situation.HasStandardAction);
+                if (!situation.HasStandardAction)
+                    return;  // Standard Action 없으면 공격 불가
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // ★ v0.2.99: Kineticist Burn 비용 체크 (Veto)
+            // ability.IsAvailable이 true여도 UnitUseAbility.CanStart에서 거부될 수 있음
+            // LeftBurnThisRound가 부족하면 명령이 시작도 못하고 무한 재시도됨
+            // ═══════════════════════════════════════════════════════════════
+            if (candidate.ActionType == CandidateType.AbilityAttack && candidate.Ability != null)
+            {
+                var kineticistComponent = candidate.Ability.Blueprint?.GetComponent<AbilityKineticist>();
+                if (kineticistComponent != null)
+                {
+                    var kineticistPart = candidate.Ability.Caster?.Get<UnitPartKineticist>();
+                    if (kineticistPart != null)
+                    {
+                        int burnCost = kineticistComponent.CalculateCost(candidate.Ability);
+                        bool canAffordBurn = kineticistPart.LeftBurnThisRound >= burnCost &&
+                                             kineticistPart.MaxBurnPerRound >= burnCost;
+                        cs.AddVeto("KineticistBurn", canAffordBurn);
+
+                        if (!canAffordBurn)
+                        {
+                            Main.Log($"[AttackScorer] ★ Kineticist ability vetoed: {candidate.Ability.Name} " +
+                                    $"cost={burnCost}, LeftBurn={kineticistPart.LeftBurnThisRound}, " +
+                                    $"MaxBurn={kineticistPart.MaxBurnPerRound}");
+                            return;  // Burn 부족 - 추가 평가 불필요
+                        }
+                    }
+                }
+            }
+
             // ★ v0.2.52: 통합 분석 획득 (캐시됨)
             var analysis = TargetAnalyzer.Analyze(candidate.Target, situation.Unit);
 
             // ═══════════════════════════════════════════════════════════════
             // 2. 사거리 (Veto for ability attacks)
+            // ★ v0.2.79: HittableEnemies 체크 우선 - 게임 API (CanTarget)가 이미 판정함
             // ═══════════════════════════════════════════════════════════════
             float distance = Vector3.Distance(situation.Unit.Position, candidate.Target.Position);
-            float range = GetAbilityRange(candidate.Ability);
 
-            if (candidate.ActionType == CandidateType.AbilityAttack && range > 0)
+            // ★ v0.2.79: 게임 API가 이미 hittable로 판정한 타겟은 InRange 통과
+            bool isTargetHittable = situation.HittableEnemies?.Contains(candidate.Target) == true;
+
+            if (isTargetHittable)
             {
-                // 능력 공격: 사거리 밖이면 Veto
-                cs.AddVeto("InRange", distance <= range * 1.1f);  // 10% 여유
+                // 게임 API(CanTarget)가 확인한 타겟 - InRange 자동 통과
+                cs.AddVeto("InRange", true);
+            }
+            else if (candidate.ActionType == CandidateType.AbilityAttack)
+            {
+                // Hittable 아닌데 능력 공격: 커스텀 사거리 체크 (폴백)
+                float range = GetAbilityRange(candidate.Ability);
+                if (range > 0)
+                {
+                    cs.AddVeto("InRange", distance <= range * 1.1f);  // 10% 여유
+                }
+                else
+                {
+                    cs.AddVeto("InRange", true);  // 범위 정보 없으면 통과
+                }
             }
             else
             {
@@ -181,9 +241,59 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
             // ═══════════════════════════════════════════════════════════════
             // 8. 공격 가능 여부 (Hittable)
+            // ★ v0.2.112: 이동 후 도달 가능한 타겟 = 사실상 공격 가능
+            // 게임의 UnitAttack 명령은 자동으로 이동 후 공격하므로
+            // Move+Attack으로 도달 가능하면 Hittable과 동등하게 처리
             // ═══════════════════════════════════════════════════════════════
             bool hittable = situation.HittableEnemies?.Contains(candidate.Target) ?? true;
-            cs.Add("Hittable", hittable ? 1.0f : 0.4f);
+            float hittableScore;
+            if (hittable)
+            {
+                // 현재 사거리 내
+                hittableScore = 1.0f;
+            }
+            else if (situation.HasMoveAction && situation.CanMove)
+            {
+                // ★ v0.2.112: 이동 후 도달 가능 여부 실제 확인
+                float weaponRange = situation.WeaponRange;
+                float maxReach = situation.MaxMoveDistance + weaponRange;
+                float targetDist = Vector3.Distance(situation.Unit.Position, candidate.Target.Position);
+
+                if (targetDist <= maxReach + 1f)
+                {
+                    // 이동+공격으로 도달 가능 - 게임이 자동으로 처리
+                    // Hittable과 거의 동등하게 취급 (0.95)
+                    hittableScore = 0.95f;
+                    Main.Log($"[AttackScorer] ★ {candidate.Target?.CharacterName}: Reachable via Move+Attack " +
+                            $"(dist={targetDist:F1}m <= reach={maxReach:F1}m) - Hittable=0.95");
+                }
+                else
+                {
+                    // 이동해도 도달 불가
+                    hittableScore = 0.2f;
+                    Main.Verbose($"[AttackScorer] {candidate.Target?.CharacterName}: NOT reachable " +
+                                $"(dist={targetDist:F1}m > reach={maxReach:F1}m) - Hittable=0.2");
+                }
+            }
+            else
+            {
+                // 이동 불가 + 사거리 밖 = 공격 불가
+                hittableScore = 0.2f;
+            }
+            cs.Add("Hittable", hittableScore);
+
+            // ═══════════════════════════════════════════════════════════════
+            // ★ v0.2.72: 적중 확률 (HitChanceCalculator 사용)
+            // 실제 공격 보너스와 타겟 AC를 기반으로 적중 확률 계산
+            // ═══════════════════════════════════════════════════════════════
+            float hitChance = CalculateHitChanceForCandidate(candidate, situation);
+            cs.Add("HitChance", hitChance);
+
+            // 적중률이 매우 낮으면 (10% 미만) 페널티 강화
+            if (hitChance < 0.1f)
+            {
+                cs.Add("LowHitPenalty", 0.2f);  // 추가 페널티
+            }
 
             // ═══════════════════════════════════════════════════════════════
             // ★ v0.2.41: 돌격(Charge) 거리 패널티
@@ -735,6 +845,59 @@ namespace CompanionAI_Pathfinder.Scoring.Scorers
 
         // ★ v0.2.52: GetHPPercent(), AssessThreat() 삭제됨 - TargetAnalyzer 사용
         // ★ v0.2.55: CountAlliesEngagedByEnemy() 삭제됨 - TargetScorer.ScoreEnemyUnified()에서 처리
+
+        /// <summary>
+        /// ★ v0.2.72: 후보 행동의 적중 확률 계산
+        /// ★ v0.2.75: 연속 공격 페널티 반영 (풀 어택 시)
+        /// HitChanceCalculator를 사용하여 실제 공격 보너스와 AC 기반 적중률 계산
+        /// </summary>
+        private float CalculateHitChanceForCandidate(ActionCandidate candidate, Situation situation)
+        {
+            try
+            {
+                var attacker = situation.Unit;
+                var target = candidate.Target;
+
+                if (attacker == null || target == null)
+                    return 0.5f;
+
+                // 능력 공격인지 기본 공격인지에 따라 다른 계산
+                if (candidate.ActionType == CandidateType.AbilityAttack && candidate.Ability != null)
+                {
+                    var hitResult = HitChanceCalculator.CalculateAbilityHitChance(attacker, target, candidate.Ability);
+
+                    // 로그 (디버그용)
+                    if (hitResult.HitChance < 0.3f || hitResult.HitChance > 0.95f)
+                    {
+                        Main.Verbose($"[AttackScorer] HitChance: {candidate.Ability.Name} " +
+                                   $"vs {target.CharacterName} - {hitResult}");
+                    }
+
+                    return hitResult.HitChance;
+                }
+                else
+                {
+                    // ★ v0.2.75: 풀 어택 (무기 공격) - 연속 공격 페널티 포함
+                    var weapon = attacker.GetFirstWeapon();
+                    var fullAttackResult = HitChanceCalculator.CalculateFullAttackHitChance(attacker, target, weapon);
+
+                    // 로그 (디버그용)
+                    if (fullAttackResult.TotalAttacks > 1)
+                    {
+                        Main.Verbose($"[AttackScorer] FullAttack: {attacker.CharacterName} " +
+                                   $"vs {target.CharacterName} - {fullAttackResult}");
+                    }
+
+                    // 가중 평균 사용 (첫 번째 공격에 더 높은 비중)
+                    return fullAttackResult.WeightedHitChance;
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Error($"[AttackScorer] CalculateHitChanceForCandidate error: {ex.Message}");
+                return 0.5f;
+            }
+        }
 
         private bool IsTargetFlanked(UnitEntityData target, Situation situation)
         {

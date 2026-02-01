@@ -9,6 +9,7 @@ using UnityEngine;
 using CompanionAI_Pathfinder.Core;
 using CompanionAI_Pathfinder.Analysis;
 using CompanionAI_Pathfinder.Settings;
+using CompanionAI_Pathfinder.GameInterface;
 
 namespace CompanionAI_Pathfinder.Planning.Plans
 {
@@ -187,6 +188,8 @@ namespace CompanionAI_Pathfinder.Planning.Plans
 
         /// <summary>
         /// 적에게 이동 계획
+        /// ★ v0.2.94: MovementPlanner 통합 - InfluenceMap/BattlefieldGrid 사용
+        /// Range 캐릭터는 안전한 사격 위치로, 근접은 근접 공격 위치로
         /// </summary>
         protected PlannedAction PlanMoveToEnemy(Situation situation, ref bool hasMoveAction)
         {
@@ -200,18 +203,44 @@ namespace CompanionAI_Pathfinder.Planning.Plans
             if (target == null)
                 return null;
 
-            // 간단히 적 방향으로 이동
+            // ★ v0.2.94: MovementPlanner 사용 - Role/상황에 따른 전술적 이동
+            var moveDecision = MovementPlanner.PlanMove(situation, RoleName, forceMove: true);
+
+            if (moveDecision != null)
+            {
+                hasMoveAction = false;
+                Main.Log($"[{RoleName}] Tactical move: {moveDecision.Reason}");
+                return PlannedAction.Move(moveDecision.Destination, moveDecision.Reason);
+            }
+
+            // MovementPlanner가 실패한 경우에만 폴백 (단순 이동)
+            // ★ v0.2.94: Range 캐릭터는 적에게 접근하지 않음!
+            if (situation.PrefersRanged)
+            {
+                Main.Log($"[{RoleName}] Range character - no safe position, skipping move");
+                return null;  // Range는 안전한 위치가 없으면 이동 안함
+            }
+
+            // 근접만 단순 접근 (최후의 수단)
             Vector3 direction = (target.Position - situation.Unit.Position).normalized;
-            float moveDistance = 6f;  // 기본 이동 거리 (30 feet ≈ 6m)
+            float moveDistance = 6f;
             Vector3 destination = situation.Unit.Position + direction * moveDistance;
 
+            // BattlefieldGrid 검증
+            if (!BattlefieldGrid.Instance.ValidateTargetPosition(situation.Unit, destination))
+            {
+                Main.Log($"[{RoleName}] Fallback move position invalid");
+                return null;
+            }
+
             hasMoveAction = false;
-            Main.Log($"[{RoleName}] Move toward: {target.CharacterName}");
+            Main.Log($"[{RoleName}] Fallback move toward: {target.CharacterName}");
             return PlannedAction.Move(destination, $"Move toward {target.CharacterName}");
         }
 
         /// <summary>
         /// 후퇴 계획 (원거리용)
+        /// ★ v0.2.94: MovementPlanner.PlanRetreat 사용
         /// </summary>
         protected PlannedAction PlanRetreat(Situation situation, ref bool hasMoveAction)
         {
@@ -224,29 +253,44 @@ namespace CompanionAI_Pathfinder.Planning.Plans
             if (!situation.IsInDanger)
                 return null;
 
+            // ★ v0.2.94: MovementPlanner 사용 - 전술적 후퇴 위치 계산
+            var retreatDecision = MovementPlanner.PlanRetreat(situation, RoleName);
+
+            if (retreatDecision != null)
+            {
+                hasMoveAction = false;
+                Main.Log($"[{RoleName}] Tactical retreat: {retreatDecision.Reason}");
+                return PlannedAction.Move(retreatDecision.Destination, retreatDecision.Reason);
+            }
+
+            // 폴백: 단순 후퇴 (적 반대 방향)
             var threat = situation.NearestEnemy;
             if (threat == null)
                 return null;
 
-            // 적 반대 방향으로 이동
             Vector3 direction = (situation.Unit.Position - threat.Position).normalized;
             float moveDistance = 6f;
             Vector3 destination = situation.Unit.Position + direction * moveDistance;
 
+            // BattlefieldGrid 검증
+            if (!BattlefieldGrid.Instance.ValidateTargetPosition(situation.Unit, destination))
+            {
+                Main.Log($"[{RoleName}] Fallback retreat position invalid");
+                return null;
+            }
+
             hasMoveAction = false;
-            Main.Log($"[{RoleName}] Retreat from: {threat.CharacterName}");
+            Main.Log($"[{RoleName}] Fallback retreat from: {threat.CharacterName}");
             return PlannedAction.Move(destination, $"Retreat from {threat.CharacterName}");
         }
 
         /// <summary>
         /// 후퇴 필요 여부 (원거리 캐릭터용)
+        /// ★ v0.2.94: MovementPlanner.ShouldRetreat 사용 (더 정교한 판단)
         /// </summary>
         protected bool ShouldRetreat(Situation situation)
         {
-            if (!situation.PrefersRanged)
-                return false;
-
-            return situation.IsInDanger;
+            return MovementPlanner.ShouldRetreat(situation);
         }
 
         #endregion
